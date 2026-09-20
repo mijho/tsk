@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::domain::{DomainState, Task, STORE_FORMAT_VERSION};
 use crate::fsperm;
+use crate::sync::client::{self, RemoteClient, RemoteError};
 
 /// On-disk document name under the state directory.
 const STATE_FILE: &str = "tsk.json";
@@ -282,6 +283,20 @@ impl TaskStore {
         &self.path
     }
 
+    /// Whether this store is selected for authenticated remote synchronization.
+    pub fn is_remote(&self) -> bool {
+        client::selected_config_path(&self.path).is_some()
+    }
+
+    fn remote_client(&self) -> Result<Option<RemoteClient>, StoreError> {
+        let Some(config_path) = client::selected_config_path(&self.path) else {
+            return Ok(None);
+        };
+        RemoteClient::open(&self.path, &config_path)
+            .map(Some)
+            .map_err(remote_store_error)
+    }
+
     /// Live document path (`tsk.json` under the state directory).
     pub fn state_file(&self) -> PathBuf {
         self.path.join(STATE_FILE)
@@ -290,6 +305,29 @@ impl TaskStore {
     /// The live document's change signature. `None` when the file does not exist
     /// yet (a fresh, never-saved store) or its metadata could not be read.
     pub fn state_signature(&self) -> Option<StoreSignature> {
+        if let Some(config_path) = client::selected_config_path(&self.path) {
+            client::poll_in_background(self.path.clone(), config_path);
+            let (cursor, stale, _error) = client::cached_signature(&self.path)?;
+            let marker = u64::from(stale);
+            #[cfg(unix)]
+            {
+                return Some(StoreSignature {
+                    dev: 0x7473_6b73_796e_6301,
+                    ino: cursor,
+                    modified: UNIX_EPOCH,
+                    len: marker,
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                return Some(StoreSignature {
+                    modified: UNIX_EPOCH
+                        .checked_add(Duration::from_secs(cursor))
+                        .unwrap_or(UNIX_EPOCH),
+                    len: marker,
+                });
+            }
+        }
         let metadata = fs::metadata(self.state_file()).ok()?;
         let modified = metadata.modified().ok()?;
         let len = metadata.len();
@@ -312,6 +350,20 @@ impl TaskStore {
     /// Load domain state. Missing file yields an empty state (first run).
     pub fn load(&self) -> Result<DomainState, StoreError> {
         let _guard = self.lock_exclusive()?;
+        if let Some(client) = self.remote_client()? {
+            return client.load().map_err(remote_store_error);
+        }
+        self.load_unlocked()
+    }
+
+    /// Load the authoritative response cache after a completed transition without another
+    /// network round trip. Used for values, such as server-assigned task numbers, that can
+    /// legitimately differ from the closure's provisional result.
+    pub(crate) fn load_after_transition(&self) -> Result<DomainState, StoreError> {
+        let _guard = self.lock_exclusive()?;
+        if let Some(client) = self.remote_client()? {
+            return client.load_cached_local().map_err(remote_store_error);
+        }
         self.load_unlocked()
     }
 
@@ -322,6 +374,11 @@ impl TaskStore {
     pub fn save(&self, state: &DomainState) -> Result<(), StoreError> {
         check_format_version(state.format_version())?;
         let _guard = self.lock_exclusive()?;
+        if self.remote_client()?.is_some() {
+            return Err(remote_store_error(RemoteError::unsupported(
+                "direct save is unavailable on a shared board; retry through a task transition",
+            )));
+        }
         let mut durable = state.clone();
         durable.assign_numbers_for_persistence();
         durable.clear_merge_bases();
@@ -332,6 +389,10 @@ impl TaskStore {
     /// after a crash). Takes the exclusive lock so a read never races a rewrite.
     pub fn load_trash(&self) -> Result<Vec<TrashLine>, StoreError> {
         let _guard = self.lock_exclusive()?;
+        if self.remote_client()?.is_some() {
+            // Shared tombstones stay in the authoritative snapshot; local trash files are ignored.
+            return Ok(Vec::new());
+        }
         self.load_trash_unlocked()
     }
 
@@ -360,6 +421,13 @@ impl TaskStore {
     /// trailing trash rewrite is not an error: the stale line is hidden by every reader
     /// and dropped by the next trash rewrite (which removes lines whose id is live).
     pub fn restore_from_trash(&self, target: TrashTarget) -> Result<TrashLine, TrashError> {
+        if self.is_remote() {
+            return Err(TrashError::Store(remote_store_error(
+                RemoteError::unsupported(
+                    "trash-file restore is unavailable on a shared board; restore a live deleted task instead",
+                ),
+            )));
+        }
         self.restore_from_trash_with(target, &StdFilesystem)
     }
 
@@ -402,6 +470,20 @@ impl TaskStore {
         transition: impl FnOnce(&mut DomainState) -> Result<T, String>,
     ) -> Result<T, String> {
         let _guard = self.lock_exclusive().map_err(|error| error.to_string())?;
+        if let Some(client) = self.remote_client().map_err(|error| error.to_string())? {
+            client
+                .reconcile_pending()
+                .map_err(|error| error.to_string())?;
+            let base = client
+                .fetch_live_local()
+                .map_err(|error| error.to_string())?;
+            let mut state = base.clone();
+            let result = transition(&mut state)?;
+            client
+                .submit(&base, &state)
+                .map_err(|error| error.to_string())?;
+            return Ok(result);
+        }
         let mut state = self.load_unlocked().map_err(|error| error.to_string())?;
         let result = transition(&mut state)?;
         state.assign_numbers_for_persistence();
@@ -420,6 +502,22 @@ impl TaskStore {
         transition: impl FnOnce(&mut DomainState) -> Result<(T, bool), String>,
     ) -> Result<T, String> {
         let _guard = self.lock_exclusive().map_err(|error| error.to_string())?;
+        if let Some(client) = self.remote_client().map_err(|error| error.to_string())? {
+            client
+                .reconcile_pending()
+                .map_err(|error| error.to_string())?;
+            let base = client
+                .fetch_live_local()
+                .map_err(|error| error.to_string())?;
+            let mut state = base.clone();
+            let (result, changed) = transition(&mut state)?;
+            if changed {
+                client
+                    .submit(&base, &state)
+                    .map_err(|error| error.to_string())?;
+            }
+            return Ok(result);
+        }
         let mut state = self.load_unlocked().map_err(|error| error.to_string())?;
         let (result, changed) = transition(&mut state)?;
         if changed {
@@ -446,6 +544,15 @@ impl TaskStore {
         ) -> Result<(T, bool, bool), String>,
     ) -> Result<T, String> {
         let _guard = self.lock_exclusive().map_err(|error| error.to_string())?;
+        if self
+            .remote_client()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err(
+                "delivery seeding is local-only and is disabled on a shared board".to_string(),
+            );
+        }
         let mut state = self.load_unlocked().map_err(|error| error.to_string())?;
         let mut record = crate::delivery::load(self.path());
         let (result, state_changed, record_changed) = transition(&mut state, &mut record)?;
@@ -484,6 +591,20 @@ impl TaskStore {
     /// changed from, merge sibling records, then durably write. Divergent same-task writes are
     /// rejected rather than ordered by wall clock or silently overwritten.
     pub fn reload_merge_save(&self, local: &mut DomainState) -> Result<(), StoreError> {
+        check_format_version(local.format_version())?;
+        if let Some(config_path) = client::selected_config_path(&self.path) {
+            let _guard = self.lock_exclusive()?;
+            let client =
+                RemoteClient::open(&self.path, &config_path).map_err(remote_store_error)?;
+            client.reconcile_pending().map_err(remote_store_error)?;
+            let fresh = client.fetch_live_local().map_err(remote_store_error)?;
+            local
+                .merge_for_save(&fresh)
+                .map_err(|message| StoreError::Remote(format!("sync conflict: {message}")))?;
+            let authoritative = client.submit(&fresh, local).map_err(remote_store_error)?;
+            *local = authoritative.unwrap_or(fresh);
+            return Ok(());
+        }
         self.reload_merge_save_with(local, &StdFilesystem)
     }
 
@@ -836,6 +957,14 @@ fn is_private_state_name(name: &str) -> bool {
         || name == TRASH_FILE
         || name == "update.json"
         || name == crate::delivery::DELIVERY_FILE
+        || name == "sync-cache.json"
+        || name == "sync-pending.json"
+        || name == "sync-stale.json"
+        || name == "sync-error.json"
+        || name.starts_with(".sync-cache.json.tmp.")
+        || name.starts_with(".sync-pending.json.tmp.")
+        || name.starts_with(".sync-stale.json.tmp.")
+        || name.starts_with(".sync-error.json.tmp.")
         || name.starts_with(&format!("{STATE_FILE}.v"))
         || name.starts_with(&format!(".{STATE_FILE}.tmp."))
         || name.starts_with(&format!(".{TRASH_FILE}.tmp."))
@@ -972,6 +1101,7 @@ pub enum StoreError {
     Io(io::Error),
     Json(serde_json::Error),
     UnsupportedFormat { found: u32, supported: u32 },
+    Remote(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -983,6 +1113,7 @@ impl std::fmt::Display for StoreError {
                 f,
                 "store format {found} is unsupported by this tsk (expected {supported})"
             ),
+            StoreError::Remote(message) => write!(f, "{message}"),
         }
     }
 }
@@ -992,7 +1123,7 @@ impl std::error::Error for StoreError {
         match self {
             StoreError::Io(e) => Some(e),
             StoreError::Json(e) => Some(e),
-            StoreError::UnsupportedFormat { .. } => None,
+            StoreError::UnsupportedFormat { .. } | StoreError::Remote(_) => None,
         }
     }
 }
@@ -1007,6 +1138,10 @@ impl From<serde_json::Error> for StoreError {
     fn from(value: serde_json::Error) -> Self {
         StoreError::Json(value)
     }
+}
+
+fn remote_store_error(error: RemoteError) -> StoreError {
+    StoreError::Remote(error.to_string())
 }
 
 #[cfg(test)]

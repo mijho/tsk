@@ -9,12 +9,38 @@ The board, CLI, and Herdr plugin share `~/.tsk/tsk.json`. The current store form
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `TSK_STATE_DIR` | `~/.tsk` | Task data, backups, trash, and release-check cache. With neither this nor `HOME` set, tsk refuses to run rather than pick a directory |
+| `TSK_STATE_DIR` | `~/.tsk` | Task data, backups, trash, release-check cache, and optional sync cache |
+| `TSK_SYNC_CONFIG` | `<state-dir>/sync.json` when that file exists | Select an explicit shared-board client configuration |
 | `--state-dir <dir>` | State directory | Override storage for a data command |
 
 Use a local disk. NFS and synced folders such as Dropbox or iCloud Drive are unsupported. Directory roots must be real directories, not symlinks.
 
 Herdr's plugin-specific state/config directories do not override these locations. Removing tsk leaves its task data intact.
+
+## Shared-board client
+
+A `sync.json` file in the state directory selects the authenticated remote backend. Set `TSK_SYNC_CONFIG` to select a config elsewhere. On Unix the config must be a regular file with mode `0600`; it contains a bearer secret and this shape:
+
+```json
+{
+  "endpoint": "https://sync.example.test/",
+  "workspace": "team",
+  "bearer": "secret-token",
+  "projects": [
+    {
+      "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "name": "atlas",
+      "path": "/home/alice/src/atlas"
+    }
+  ]
+}
+```
+
+Project IDs and names are shared identities; `path` is this machine's absolute checkout path. Local paths are translated to `shared://<id>/<name>` before upload and are never sent to the service.
+
+Reads fetch an authenticated snapshot and cache its wire state and cursor in `sync-cache.json`. Transport failures may use that cache and write `sync-stale.json` with its age; authentication, authorization, and protocol failures never fall back. Writes always require a live snapshot. An uncertain write remains in `sync-pending.json` and is resent with the same operation ID before another write, so a lost response cannot duplicate the operation. The open board polls the remote cursor every few seconds.
+
+Shared undo, project archive/unarchive, starter/release-note delivery, and `trash.jsonl` restore are not supported by this protocol version. Deleted shared tasks remain tombstones in the shared snapshot and can be restored through normal task actions. Local-only mode is unchanged when no sync config is selected.
 
 ## Backups
 

@@ -73,6 +73,9 @@ impl DomainState {
     /// Empty stack is a documented no-op. Stale entries are retained so a refused Undo never
     /// changes durable state or exposes an older entry accidentally.
     pub fn undo(&mut self) -> Result<(), DomainError> {
+        if self.is_shared() {
+            return Err(DomainError::SharedUndoUnsupported);
+        }
         let Some(entry) = self.last_undo().cloned() else {
             return Ok(());
         };

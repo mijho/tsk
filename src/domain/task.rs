@@ -105,6 +105,8 @@ pub enum DomainError {
     SoftDeleted(Uuid),
     /// Undo target changed after the undoable action was recorded.
     StaleUndo(Uuid),
+    /// Shared remote state deliberately carries no cross-client undo history.
+    SharedUndoUnsupported,
     /// Step text was empty or whitespace-only after trim.
     EmptyStepText,
     /// No step with this id exists on the task.
@@ -121,6 +123,9 @@ impl std::fmt::Display for DomainError {
             DomainError::SoftDeleted(id) => write!(f, "task {id} is soft-deleted"),
             DomainError::StaleUndo(id) => {
                 write!(f, "task {id} changed since the undoable action")
+            }
+            DomainError::SharedUndoUnsupported => {
+                write!(f, "undo is unavailable on a shared board")
             }
             DomainError::EmptyStepText => write!(f, "step text must be non-empty after trim"),
             DomainError::UnknownStep(id) => write!(f, "unknown step id {id}"),
@@ -234,6 +239,9 @@ pub struct DomainState {
     project_intents: BTreeMap<String, bool>,
     /// LIFO undo records for soft-delete and complete.
     undo_stack: Vec<UndoEntry>,
+    /// Client-only marker: remote snapshots disable local undo rather than sharing stale intent.
+    #[serde(skip)]
+    shared_mode: bool,
 }
 
 impl Default for DomainState {
@@ -252,6 +260,7 @@ impl DomainState {
             projects: BTreeMap::new(),
             project_intents: BTreeMap::new(),
             undo_stack: Vec::new(),
+            shared_mode: false,
         }
     }
 
@@ -872,6 +881,42 @@ impl DomainState {
                     .all(|(id, _)| self.tasks.iter().any(|task| task.id == id))
             });
         }
+    }
+
+    /// Mark a translated remote snapshot so shared undo is refused in the domain boundary.
+    pub(crate) fn mark_shared(&mut self) {
+        self.shared_mode = true;
+        self.undo_stack.clear();
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        self.shared_mode
+    }
+
+    /// Strip client-local save metadata before a state is sent over the sync protocol.
+    pub(crate) fn clear_client_only_sync_state(&mut self) {
+        self.undo_stack.clear();
+        self.clear_merge_bases();
+        self.shared_mode = false;
+    }
+
+    /// Apply server-validated task replacements to an authoritative sync projection.
+    /// Callers validate identities and revisions before entering this narrow mutation boundary.
+    pub(crate) fn apply_sync_tasks(&mut self, replacements: Vec<Task>) {
+        for replacement in replacements {
+            if let Some(existing) = self.tasks.iter_mut().find(|task| task.id == replacement.id) {
+                *existing = replacement;
+            } else {
+                self.tasks.push(replacement);
+            }
+        }
+    }
+
+    /// Normalize state before it is written to the shared append-only log. Shared sync does not
+    /// expose the local undo stack, and merge bases are client-local save intent.
+    pub(crate) fn finalize_for_sync(&mut self) {
+        self.clear_client_only_sync_state();
+        self.assign_numbers_for_persistence();
     }
 
     /// Assign missing `T` and `N` numbers in deterministic creation order. The store

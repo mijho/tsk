@@ -1,0 +1,27 @@
+{
+  "bind": "0.0.0.0:8000",
+  "s2": {
+    "access_token": "REPLACE_WITH_LOCAL_S2_TOKEN",
+    "account_endpoint": "http://127.0.0.1:8080",
+    "basin_endpoint": "http://127.0.0.1:8080",
+    "basin": "tsk-sync-demo",
+    "stream_prefix": "workspace-"
+  },
+  "tokens": [
+    {
+      "bearer": "REPLACE_WITH_CLIENT_A_BEARER",
+      "actor_id": "user-a",
+      "workspaces": ["demo"]
+    },
+    {
+      "bearer": "REPLACE_WITH_CLIENT_B_BEARER",
+      "actor_id": "user-b-agent",
+      "workspaces": ["demo"]
+    },
+    {
+      "bearer": "REPLACE_WITH_OUTSIDER_BEARER",
+      "actor_id": "acceptance-outsider",
+      "workspaces": ["other"]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=TSK S2 Lite event store
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=2
+ExecStartPre=-/usr/bin/docker rm -f tsk-s2-lite
+ExecStart=/usr/bin/docker run --rm --name tsk-s2-lite -p 127.0.0.1:8080:8080 -v tsk-s2-lite:/data ghcr.io/s2-streamstore/s2@sha256:75fb787f3d1b27572100ddcca704dc0cbc85936d899f0c88f66a2549f216fdc6 lite --port 8080 --local-root /data --path tsk --no-cors
+ExecStop=/usr/bin/docker stop -t 20 tsk-s2-lite
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

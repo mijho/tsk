@@ -9,6 +9,10 @@ the GitHub release notes verbatim.
 
 ## Unreleased
 
+### Added
+
+- Optional authenticated S2-backed shared workspaces, including the `tsk-sync` service, static per-actor workspace membership, resumable live updates, conflict detection, idempotent retries, stable project-ID/path translation, authoritative numbering, stale offline read caches, and a real-service acceptance checker.
+
 ### Changed
 
 - `walkthrough.json` and `TSK_CONFIG_DIR` are gone: the retired onboarding card is replaced by the seeded tour tasks, and an existing file is simply ignored.

@@ -128,7 +128,7 @@ pub fn run(input: FlagAdd) -> Result<FlagAddResult, AddError> {
     let global = input.global;
     let notes = input.notes.filter(|notes| !notes.trim().is_empty());
     let thread = input.thread;
-    store
+    let mut outcome = store
         .locked_transition_if_changed(|domain| {
             let scope = match resolve_flag_scope(project.as_deref(), global, domain, &snapshot) {
                 Ok(scope) => scope,
@@ -183,7 +183,23 @@ pub fn run(input: FlagAdd) -> Result<FlagAddResult, AddError> {
             Ok((outcome, changed))
         })
         .map_err(AddError::Store)
-        .and_then(|outcome| outcome)
+        .and_then(|outcome| outcome)?;
+    if store.is_remote() {
+        if let FlagAddResult::Created { id, number, .. } = &mut outcome {
+            let authoritative = store
+                .load_after_transition()
+                .map_err(|error| AddError::Store(error.to_string()))?;
+            *number = authoritative
+                .get(*id)
+                .and_then(|task| task.number)
+                .ok_or_else(|| {
+                    AddError::Store(
+                        "sync response omitted the server-assigned task number".to_string(),
+                    )
+                })?;
+        }
+    }
+    Ok(outcome)
 }
 
 /// Create every valid item from a parsed JSON plan in one durable write.
@@ -210,7 +226,7 @@ pub fn run_plan(
 
     let store = TaskStore::new(state_dir.unwrap_or_else(default_state_dir));
     let snapshot = snapshot_from_env();
-    store
+    let mut result = store
         .locked_transition_if_changed(|domain| {
             let (resolved, resolution_failures) = resolve_plan_items(valid, domain, &snapshot);
             failed.extend(resolution_failures);
@@ -275,7 +291,24 @@ pub fn run_plan(
                 changed,
             ))
         })
-        .map_err(AddError::Store)
+        .map_err(AddError::Store)?;
+    if store.is_remote() && !result.created.is_empty() {
+        let authoritative = store
+            .load_after_transition()
+            .map_err(|error| AddError::Store(error.to_string()))?;
+        for created in &mut result.created {
+            created.number = authoritative
+                .get(created.id)
+                .and_then(|task| task.number)
+                .ok_or_else(|| {
+                    AddError::Store(format!(
+                        "sync response omitted the server-assigned number for task {}",
+                        created.id
+                    ))
+                })?;
+        }
+    }
+    Ok(result)
 }
 
 fn resolve_plan_items(
