@@ -12,6 +12,7 @@ the GitHub release notes verbatim.
 ### Added
 
 - Optional authenticated S2-backed shared workspaces, including the `tsk-sync` service, static per-actor workspace membership, resumable live updates, conflict detection, idempotent retries, stable project-ID/path translation, authoritative numbering, stale offline read caches, and a real-service acceptance checker.
+- `scripts/sync-demo` for safe, idempotent local sync onboarding, read-only diagnosis, strict smoke checks, explicit disruptive/full checks with temporary failure injection, and a real two-client PTY test.
 
 ### Changed
 

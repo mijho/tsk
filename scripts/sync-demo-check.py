@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Destructive, append-only acceptance checks for the real tsk sync prototype.
+"""Append-only acceptance checks for the real tsk sync prototype.
+
+The smoke profile avoids service restarts and failure injection. The full profile preserves
+all 16 historical checks and is disruptive; prefer ``scripts/sync-demo test`` so its
+failure-injection drop-in is always cleaned up.
 
 The checker deliberately uses unique task titles and operation UUIDs. It never clears an
 S2 stream, and it never prints bearer values. It expects an already running API at
@@ -171,7 +175,7 @@ class Acceptance:
             print(f"{result.outcome:4} {result.name}{suffix}")
         counts = {outcome: sum(result.outcome == outcome for result in self.results) for outcome in ("PASS", "SKIP", "FAIL")}
         print(f"\nPASS={counts['PASS']} SKIP={counts['SKIP']} FAIL={counts['FAIL']}")
-        return 1 if counts["FAIL"] else 0
+        return 1 if counts["FAIL"] or (getattr(self.args, "fail_on_skip", False) and counts["SKIP"]) else 0
 
     def url(self, relative: str) -> str:
         return urllib.parse.urljoin(self.base_url, relative.lstrip("/"))
@@ -853,7 +857,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--api-service", default="tsk-sync.service")
     parser.add_argument("--s2-service", default="tsk-s2.service")
+    parser.add_argument(
+        "--profile",
+        choices=("smoke", "full"),
+        default="full",
+        help="smoke avoids service restarts and failure injection; full runs all 16 checks",
+    )
+    parser.add_argument(
+        "--fail-on-skip",
+        action="store_true",
+        help="return nonzero when any selected check is skipped",
+    )
     return parser.parse_args()
+
+
+def checks_for_profile(
+    acceptance: Acceptance, profile: str
+) -> list[tuple[str, Callable[[], str | None]]]:
+    smoke: list[tuple[str, Callable[[], str | None]]] = [
+        ("preflight: live API, S2 config, two external clients", acceptance.check_preflight),
+        ("pinned S2 0.42.12/digest and SDK 0.34.8", acceptance.check_pins),
+        ("A create → B receive", acceptance.check_a_create_b_receive),
+        ("B status → A receive", acceptance.check_b_update_a_receive),
+        ("concurrent creates receive distinct numbers", acceptance.check_concurrent_numbers),
+        ("direct stale same-task conflict", acceptance.check_stale_conflict),
+        ("disconnect/cursor catch-up", acceptance.check_cursor_catch_up),
+        ("stale update cannot resurrect tombstone", acceptance.check_tombstone_stale_update),
+        ("unauthorized read/write/events", acceptance.check_unauthorized),
+        ("two local paths map to one shared project", acceptance.check_project_mapping),
+        ("local-only tsk remains local", acceptance.check_local_only),
+    ]
+    if profile == "smoke":
+        return smoke
+    if profile != "full":
+        raise ValueError(f"unknown acceptance profile {profile!r}")
+    disruptive = [
+        ("lost response + exact retry + API restart dedupe", acceptance.check_lost_response_and_retry),
+        ("error before projection update", acceptance.check_error_before_projection),
+        ("crash before projection update + systemd retry", acceptance.check_crash_before_projection),
+        ("S2 + API restart persistence", acceptance.check_s2_api_restart_persistence),
+        ("projection replay equivalence after API restart", acceptance.check_projection_replay),
+    ]
+    # Keep the full profile in the historical 16-check order.
+    return [*smoke[:6], *disruptive[:3], smoke[6], *disruptive[3:], *smoke[7:]]
 
 
 def main() -> int:
@@ -865,25 +911,7 @@ def main() -> int:
         print("\nPASS=0 SKIP=0 FAIL=1")
         return 1
 
-    checks: list[tuple[str, Callable[[], str | None]]] = [
-        ("preflight: live API, S2 config, two external clients", acceptance.check_preflight),
-        ("pinned S2 0.42.12/digest and SDK 0.34.8", acceptance.check_pins),
-        ("A create → B receive", acceptance.check_a_create_b_receive),
-        ("B status → A receive", acceptance.check_b_update_a_receive),
-        ("concurrent creates receive distinct numbers", acceptance.check_concurrent_numbers),
-        ("direct stale same-task conflict", acceptance.check_stale_conflict),
-        ("lost response + exact retry + API restart dedupe", acceptance.check_lost_response_and_retry),
-        ("error before projection update", acceptance.check_error_before_projection),
-        ("crash before projection update + systemd retry", acceptance.check_crash_before_projection),
-        ("disconnect/cursor catch-up", acceptance.check_cursor_catch_up),
-        ("S2 + API restart persistence", acceptance.check_s2_api_restart_persistence),
-        ("projection replay equivalence after API restart", acceptance.check_projection_replay),
-        ("stale update cannot resurrect tombstone", acceptance.check_tombstone_stale_update),
-        ("unauthorized read/write/events", acceptance.check_unauthorized),
-        ("two local paths map to one shared project", acceptance.check_project_mapping),
-        ("local-only tsk remains local", acceptance.check_local_only),
-    ]
-    for name, function in checks:
+    for name, function in checks_for_profile(acceptance, args.profile):
         acceptance.run(name, function)
     return acceptance.print_summary()
 

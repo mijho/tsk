@@ -28,6 +28,7 @@ The quit shortcut exits from non-editor board surfaces, including task pages, He
 - `tsk --version` (or `tsk -V`) prints the installed version.
 
 Storage, backups, and release-check settings: https://gettsk.sh/docs/storage.md
+- Linux prototype sync demo: `scripts/sync-demo setup`, `scripts/sync-demo doctor`, then `scripts/sync-demo test --profile smoke`; the full profile requires `--yes-disruptive` and uses only temporary failure injection.
 - Full docs: https://gettsk.sh/llms-full.txt
 
 ## Docs

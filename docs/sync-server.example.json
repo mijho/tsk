@@ -1,5 +1,5 @@
 {
-  "bind": "0.0.0.0:8000",
+  "bind": "127.0.0.1:8000",
   "s2": {
     "access_token": "REPLACE_WITH_LOCAL_S2_TOKEN",
     "account_endpoint": "http://127.0.0.1:8080",

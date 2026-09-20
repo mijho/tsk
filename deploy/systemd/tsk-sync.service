@@ -9,8 +9,6 @@ User=exedev
 Group=exedev
 WorkingDirectory=/home/exedev/tsk
 Environment=RUST_BACKTRACE=1
-# Prototype acceptance only; remove outside an isolated test VM.
-Environment=TSK_SYNC_ENABLE_FAILURE_INJECTION=1
 ExecStart=/home/exedev/tsk/target/release/tsk-sync /etc/tsk-sync/config.json
 Restart=on-failure
 RestartSec=2

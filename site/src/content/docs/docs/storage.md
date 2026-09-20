@@ -42,6 +42,34 @@ Reads fetch an authenticated snapshot and cache its wire state and cursor in `sy
 
 Shared undo, project archive/unarchive, starter/release-note delivery, and `trash.jsonl` restore are not supported by this protocol version. Deleted shared tasks remain tombstones in the shared snapshot and can be restored through normal task actions. Local-only mode is unchanged when no sync config is selected.
 
+## Local sync demo
+
+On a Linux systemd host with Docker, the repository's supported prototype onboarding is:
+
+```sh
+scripts/sync-demo setup
+scripts/sync-demo doctor
+scripts/sync-demo test --profile smoke
+```
+
+Setup creates or adopts private `0600` server and two-client configs without printing or
+replacing credentials, maps two git directories to one stable shared project UUID, keeps
+S2 and the API on loopback by default, preserves the named Docker volume, and installs
+machine-specific managed units. Doctor is read-only. Smoke is append-only and does not
+restart services; unexpected skips fail.
+
+The complete 16-check run is intentionally disruptive and must be explicit:
+
+```sh
+scripts/sync-demo test --profile full --yes-disruptive
+```
+
+It temporarily enables failure injection through a `/run` systemd drop-in, exercises API
+crash/restart and S2 persistence, then removes the drop-in and requires a healthy restart.
+Use `scripts/sync-demo test --profile tui` for the real PTY check where an already-open
+client receives another client's create. See `README-SYNC.md` for environment overrides,
+unit-collision rules, backup/recovery, and operational commands.
+
 ## Backups
 
 | File | Contains |

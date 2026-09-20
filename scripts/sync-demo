@@ -1,0 +1,1971 @@
+#!/usr/bin/env python3
+"""Safely set up, inspect, and test the local two-client tsk sync demo.
+
+Configuration files contain bearer credentials. This program deliberately reports paths,
+actor names, and check outcomes only; it never prints configuration documents or tokens.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import getpass
+import grp
+import ipaddress
+import json
+import os
+import pathlib
+import pwd
+import re
+import secrets
+import select
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
+
+
+EXPECTED_S2_VERSION = "0.42.12"
+EXPECTED_S2_REVISION = "52b6e2e8fb7b8b7b13a34a8b7b149429ea9e726a"
+EXPECTED_S2_IMAGE = (
+    "ghcr.io/s2-streamstore/s2@"
+    "sha256:75fb787f3d1b27572100ddcca704dc0cbc85936d899f0c88f66a2549f216fdc6"
+)
+EXPECTED_SDK_VERSION = "0.34.8"
+S2_ENDPOINT = "http://127.0.0.1:8080"
+S2_VOLUME = "tsk-s2-lite"
+S2_CONTAINER = "tsk-s2-lite"
+VOLUME_INIT_IMAGE = "alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8"
+PROJECT_ID = "11111111-1111-4111-8111-111111111111"
+PROJECT_NAME = "tsk-demo"
+MANAGED_MARKER = "# Managed by scripts/sync-demo; local edits may be replaced."
+FAILURE_DROPIN = "90-tsk-sync-demo-failure.conf"
+FAILURE_DROPIN_MARKER = "# Temporary failure injection managed by scripts/sync-demo."
+PLACEHOLDER_FRAGMENTS = (
+    "REPLACE_WITH",
+    "PLACEHOLDER",
+    "/ABSOLUTE/LOCAL/PATH",
+    "sync.example.test",
+    "secret-token",
+)
+IDENTIFIER = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+SERVICE_NAME = re.compile(r"^[A-Za-z0-9_.@-]+\.service$")
+
+
+class DemoError(RuntimeError):
+    """A safe, user-facing refusal."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Settings:
+    repo: pathlib.Path
+    user: str
+    group: str
+    uid: int
+    gid: int
+    home: pathlib.Path
+    server_config: pathlib.Path
+    demo_root: pathlib.Path
+    workspace: str
+    actor_a: str
+    actor_b: str
+    outsider_actor: str
+    outsider_workspace: str
+    api_bind: str
+    endpoint: str
+    api_service: str
+    s2_service: str
+    systemd_dir: pathlib.Path
+
+    @property
+    def client_a_dir(self) -> pathlib.Path:
+        return self.demo_root / "client-a"
+
+    @property
+    def client_b_dir(self) -> pathlib.Path:
+        return self.demo_root / "client-b"
+
+    @property
+    def project_a_dir(self) -> pathlib.Path:
+        return self.demo_root / "project-a"
+
+    @property
+    def project_b_dir(self) -> pathlib.Path:
+        return self.demo_root / "project-b"
+
+    @property
+    def tsk_binary(self) -> pathlib.Path:
+        return self.repo / "target/release/tsk"
+
+    @property
+    def sync_binary(self) -> pathlib.Path:
+        return self.repo / "target/release/tsk-sync"
+
+    @property
+    def api_unit_path(self) -> pathlib.Path:
+        return self.systemd_dir / self.api_service
+
+    @property
+    def s2_unit_path(self) -> pathlib.Path:
+        return self.systemd_dir / self.s2_service
+
+    @classmethod
+    def from_environment(
+        cls,
+        repo: pathlib.Path | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> "Settings":
+        env = os.environ if environ is None else environ
+        repo = (repo or pathlib.Path(__file__).resolve().parents[1]).resolve()
+        user = env.get("SUDO_USER") or getpass.getuser()
+        try:
+            user_record = pwd.getpwnam(user)
+        except KeyError as error:
+            raise DemoError(f"cannot resolve setup user {user!r}") from error
+        group = grp.getgrgid(user_record.pw_gid).gr_name
+        home = pathlib.Path(user_record.pw_dir).resolve()
+        demo_root = pathlib.Path(
+            env.get("TSK_SYNC_DEMO_ROOT", str(home / ".local/share/tsk-sync-demo"))
+        ).expanduser()
+        server_config = pathlib.Path(
+            env.get("TSK_SYNC_SERVER_CONFIG", "/etc/tsk-sync/config.json")
+        ).expanduser()
+        workspace = env.get("TSK_SYNC_WORKSPACE", "demo")
+        actor_a = env.get("TSK_SYNC_ACTOR_A", "user-a")
+        actor_b = env.get("TSK_SYNC_ACTOR_B", "user-b-agent")
+        outsider_actor = env.get("TSK_SYNC_OUTSIDER_ACTOR", "unauthorized")
+        outsider_workspace = "other" if workspace != "other" else "outside"
+        api_bind = env.get("TSK_SYNC_API_BIND", "127.0.0.1:8000")
+        endpoint = env.get("TSK_SYNC_ENDPOINT", _endpoint_for_bind(api_bind))
+        api_service = _service_name(env.get("TSK_SYNC_API_SERVICE", "tsk-sync.service"))
+        s2_service = _service_name(env.get("TSK_SYNC_S2_SERVICE", "tsk-s2.service"))
+        systemd_dir = pathlib.Path(env.get("TSK_SYNC_SYSTEMD_DIR", "/etc/systemd/system"))
+        settings = cls(
+            repo=repo,
+            user=user,
+            group=group,
+            uid=user_record.pw_uid,
+            gid=user_record.pw_gid,
+            home=home,
+            server_config=server_config.absolute(),
+            demo_root=demo_root.absolute(),
+            workspace=workspace,
+            actor_a=actor_a,
+            actor_b=actor_b,
+            outsider_actor=outsider_actor,
+            outsider_workspace=outsider_workspace,
+            api_bind=api_bind,
+            endpoint=_normalize_endpoint(endpoint),
+            api_service=api_service,
+            s2_service=s2_service,
+            systemd_dir=systemd_dir.absolute(),
+        )
+        settings.validate()
+        return settings
+
+    def validate(self) -> None:
+        for label, value in (
+            ("workspace", self.workspace),
+            ("client A actor", self.actor_a),
+            ("client B actor", self.actor_b),
+            ("outsider actor", self.outsider_actor),
+        ):
+            if value in {".", ".."} or not IDENTIFIER.fullmatch(value):
+                raise DemoError(
+                    f"{label} must be 1..128 ASCII letters, digits, '.', '_' or '-'"
+                )
+        if len({self.actor_a, self.actor_b, self.outsider_actor}) != 3:
+            raise DemoError("the two client actors and outsider actor must be distinct")
+        _parse_bind(self.api_bind)
+        endpoint = urllib.parse.urlparse(self.endpoint)
+        if (
+            endpoint.scheme not in {"http", "https"}
+            or not endpoint.hostname
+            or endpoint.username is not None
+            or endpoint.password is not None
+            or endpoint.query
+            or endpoint.fragment
+        ):
+            raise DemoError(
+                "TSK_SYNC_ENDPOINT must be an HTTP(S) base URL without credentials, query, or fragment"
+            )
+        if endpoint.scheme == "http" and not _is_loopback_host(endpoint.hostname):
+            raise DemoError("plain HTTP TSK_SYNC_ENDPOINT values must use a loopback host")
+        if self.api_service == self.s2_service:
+            raise DemoError("the API and S2 service names must be distinct")
+        repo = self.repo.resolve()
+        for label, path in (
+            ("demo root", self.demo_root),
+            ("server config", self.server_config),
+        ):
+            resolved = path.resolve(strict=False)
+            if resolved == repo or repo in resolved.parents:
+                raise DemoError(f"{label} must be outside the repository: {path}")
+        if self.client_a_dir == self.client_b_dir or self.project_a_dir == self.project_b_dir:
+            raise DemoError("client and project paths must be distinct")
+
+
+@dataclasses.dataclass
+class Configuration:
+    server: dict[str, Any]
+    client_a: dict[str, Any]
+    client_b: dict[str, Any]
+    secrets: set[str]
+
+
+@dataclasses.dataclass
+class CheckResult:
+    name: str
+    outcome: str
+    detail: str = ""
+
+
+class SecretRedactor:
+    def __init__(self) -> None:
+        self.secrets: set[str] = set()
+
+    def collect(self, value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                self.collect(child, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                self.collect(child, key)
+        elif key in {"bearer", "access_token"} and isinstance(value, str) and value:
+            self.secrets.add(value)
+
+    def sanitize(self, value: object) -> str:
+        text = str(value).replace("\n", " ").strip()
+        for secret in sorted(self.secrets, key=len, reverse=True):
+            text = text.replace(secret, "<redacted>")
+        return text
+
+
+def _service_name(value: str) -> str:
+    name = value if value.endswith(".service") else f"{value}.service"
+    if not SERVICE_NAME.fullmatch(name) or "/" in name:
+        raise DemoError(f"invalid systemd service name: {value!r}")
+    return name
+
+
+def _parse_bind(value: str) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]:
+    try:
+        if value.startswith("["):
+            host, port_text = value[1:].split("]:", 1)
+        else:
+            host, port_text = value.rsplit(":", 1)
+        address = ipaddress.ip_address(host)
+        port = int(port_text)
+    except (ValueError, TypeError) as error:
+        raise DemoError("TSK_SYNC_API_BIND must be an IP address and port") from error
+    if not 1 <= port <= 65535:
+        raise DemoError("TSK_SYNC_API_BIND port must be between 1 and 65535")
+    if address.version == 6 and not value.startswith("["):
+        raise DemoError("IPv6 TSK_SYNC_API_BIND values must use [address]:port syntax")
+    return address, port
+
+
+def _endpoint_for_bind(bind: str) -> str:
+    address, port = _parse_bind(bind)
+    host = str(address) if address.is_loopback else "127.0.0.1"
+    if address.version == 6 and address.is_loopback:
+        host = f"[{host}]"
+    return f"http://{host}:{port}/"
+
+
+def _normalize_endpoint(value: str) -> str:
+    return value.rstrip("/") + "/"
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _contains_placeholder(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(_contains_placeholder(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_placeholder(child) for child in value)
+    return isinstance(value, str) and any(fragment in value for fragment in PLACEHOLDER_FRAGMENTS)
+
+
+def _path_exists(path: pathlib.Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _reject_symlink_components(path: pathlib.Path) -> None:
+    absolute = path.absolute()
+    current = pathlib.Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise DemoError(f"cannot inspect path component {current}: {error}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise DemoError(f"refusing symlink path component {current}")
+
+
+def _reject_symlink_or_wrong_type(path: pathlib.Path, kind: str) -> os.stat_result | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise DemoError(f"cannot inspect {path}: {error}") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise DemoError(f"refusing symlink {path}")
+    expected = stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+    if not expected(metadata.st_mode):
+        raise DemoError(f"{path} must be a regular {kind}")
+    return metadata
+
+
+def ensure_private_directory(path: pathlib.Path, mode: int = 0o700) -> None:
+    metadata = _reject_symlink_or_wrong_type(path, "directory")
+    if metadata is None:
+        path.mkdir(parents=True, mode=mode)
+        metadata = _reject_symlink_or_wrong_type(path, "directory")
+    assert metadata is not None
+    if stat.S_IMODE(metadata.st_mode) != mode:
+        try:
+            path.chmod(mode)
+        except OSError as error:
+            raise DemoError(f"cannot set {path} permissions to {mode:04o}: {error}") from error
+
+
+def read_private_json(
+    path: pathlib.Path, label: str, expected_uid: int | None = None
+) -> dict[str, Any]:
+    metadata = _reject_symlink_or_wrong_type(path, "file")
+    if metadata is None:
+        raise DemoError(f"missing {label}: {path}")
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise DemoError(f"{label} permissions must be exactly 0600: {path}")
+    if os.name == "posix" and expected_uid is not None and metadata.st_uid != expected_uid:
+        raise DemoError(f"{label} must be owned by uid {expected_uid}: {path}")
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise DemoError(f"{label} changed while it was being opened: {path}")
+            if os.name == "posix" and stat.S_IMODE(opened.st_mode) != 0o600:
+                raise DemoError(f"opened {label} permissions must be exactly 0600: {path}")
+            if os.name == "posix" and expected_uid is not None and opened.st_uid != expected_uid:
+                raise DemoError(f"opened {label} must be owned by uid {expected_uid}: {path}")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+                descriptor = -1
+                value = json.load(source)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    except DemoError:
+        raise
+    except (OSError, json.JSONDecodeError) as error:
+        raise DemoError(f"cannot read {label} {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise DemoError(f"{label} must contain a JSON object: {path}")
+    if _contains_placeholder(value):
+        raise DemoError(f"{label} contains placeholder values: {path}")
+    return value
+
+
+def _json_bytes(document: dict[str, Any]) -> bytes:
+    return (json.dumps(document, indent=2) + "\n").encode("utf-8")
+
+
+def atomic_create(path: pathlib.Path, contents: bytes, mode: int = 0o600) -> None:
+    """Create path atomically and never replace an existing directory entry."""
+    if _path_exists(path):
+        raise FileExistsError(path)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(contents)
+            output.flush()
+            os.fsync(output.fileno())
+        os.link(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_replace(path: pathlib.Path, contents: bytes, mode: int) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(contents)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+_ROOT_FILE_HELPER = r"""
+import os, pathlib, stat, sys, tempfile
+operation, raw_path, raw_mode, raw_uid, raw_gid = sys.argv[1:]
+path = pathlib.Path(raw_path)
+mode, uid, gid = int(raw_mode, 8), int(raw_uid), int(raw_gid)
+
+current = pathlib.Path(path.anchor)
+for part in path.absolute().parts[1:-1]:
+    current /= part
+    try:
+        component = current.lstat()
+    except FileNotFoundError:
+        continue
+    if stat.S_ISLNK(component.st_mode):
+        raise SystemExit(f"refusing symlink path component: {current}")
+
+def regular_or_absent(target, expected):
+    try:
+        value = target.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(value.st_mode) or not expected(value.st_mode):
+        raise SystemExit(f"refusing unsafe path: {target}")
+    return value
+
+if operation == "directory":
+    existing = regular_or_absent(path, stat.S_ISDIR)
+    if existing is None:
+        regular_or_absent(path.parent, stat.S_ISDIR) or (_ for _ in ()).throw(SystemExit("missing parent"))
+        path.mkdir(mode=mode)
+    os.chown(path, uid, gid)
+    os.chmod(path, mode)
+    raise SystemExit(0)
+
+regular_or_absent(path.parent, stat.S_ISDIR) or (_ for _ in ()).throw(SystemExit("missing parent"))
+data = sys.stdin.buffer.read()
+if operation == "create" and os.path.lexists(path):
+    raise SystemExit(17)
+fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+temp = pathlib.Path(temp_name)
+try:
+    os.fchmod(fd, mode)
+    os.fchown(fd, uid, gid)
+    with os.fdopen(fd, "wb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    if operation == "create":
+        os.link(temp, path)
+    elif operation == "replace":
+        existing = regular_or_absent(path, stat.S_ISREG)
+        os.replace(temp, path)
+    else:
+        raise SystemExit("unknown operation")
+    directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    try:
+        temp.unlink()
+    except FileNotFoundError:
+        pass
+"""
+
+
+def _trusted_executable(name: str) -> str:
+    candidates = [shutil.which(name), f"/usr/bin/{name}", f"/bin/{name}"]
+    inspected: list[str] = []
+    for found in candidates:
+        if not found or found in inspected:
+            continue
+        inspected.append(found)
+        try:
+            resolved = pathlib.Path(found).resolve(strict=True)
+            metadata = resolved.stat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == 0
+            and not metadata.st_mode & 0o022
+            and os.access(resolved, os.X_OK)
+        ):
+            return str(resolved)
+    raise DemoError(f"required trusted privileged executable is unavailable: {name}")
+
+
+def _root_prefix() -> list[str]:
+    if os.geteuid() == 0:
+        return []
+    return [_trusted_executable("sudo"), "--"]
+
+
+def _run_root_file_helper(
+    operation: str,
+    path: pathlib.Path,
+    contents: bytes,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> None:
+    command = [
+        *_root_prefix(),
+        _trusted_executable("python3"),
+        "-I",
+        "-c",
+        _ROOT_FILE_HELPER,
+        operation,
+        str(path),
+        f"{mode:o}",
+        str(uid),
+        str(gid),
+    ]
+    completed = subprocess.run(
+        command,
+        input=contents,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise DemoError(f"cannot {operation} {path}: {detail or 'privileged helper failed'}")
+
+
+def ensure_owned_directory(settings: Settings, path: pathlib.Path, mode: int) -> None:
+    metadata = _reject_symlink_or_wrong_type(path, "directory")
+    if metadata is not None and os.access(path, os.W_OK):
+        ensure_private_directory(path, mode)
+        return
+    if metadata is None and os.access(path.parent, os.W_OK):
+        path.mkdir(mode=mode)
+        path.chmod(mode)
+        return
+    _run_root_file_helper("directory", path, b"", mode, settings.uid, settings.gid)
+
+
+def create_private_json(
+    settings: Settings, path: pathlib.Path, document: dict[str, Any]
+) -> None:
+    contents = _json_bytes(document)
+    if os.access(path.parent, os.W_OK):
+        atomic_create(path, contents, 0o600)
+    else:
+        _run_root_file_helper("create", path, contents, 0o600, settings.uid, settings.gid)
+
+
+def replace_system_file(settings: Settings, path: pathlib.Path, contents: bytes) -> None:
+    if os.access(path.parent, os.W_OK):
+        atomic_replace(path, contents, 0o644)
+    else:
+        _run_root_file_helper("replace", path, contents, 0o644, 0, 0)
+
+
+def _required_string(document: dict[str, Any], key: str, label: str) -> str:
+    value = document.get(key)
+    if not isinstance(value, str) or not value:
+        raise DemoError(f"{label} must contain a non-empty {key}")
+    return value
+
+
+def _server_token(server: dict[str, Any], actor: str) -> dict[str, Any]:
+    tokens = server.get("tokens")
+    if not isinstance(tokens, list):
+        raise DemoError("server config tokens must be an array")
+    matches = [record for record in tokens if isinstance(record, dict) and record.get("actor_id") == actor]
+    if len(matches) != 1:
+        raise DemoError(f"server config must contain exactly one token for actor {actor!r}")
+    return matches[0]
+
+
+def validate_server_config(
+    server: dict[str, Any], settings: Settings, *, enforce_bind: bool = True
+) -> None:
+    if set(server) != {"bind", "s2", "tokens"}:
+        raise DemoError("server config has missing or unknown top-level fields")
+    try:
+        _parse_bind(str(server.get("bind", "")))
+    except DemoError as error:
+        raise DemoError("server config contains an invalid bind address") from error
+    if enforce_bind and server.get("bind") != settings.api_bind:
+        raise DemoError(
+            f"server bind {server.get('bind')!r} does not match TSK_SYNC_API_BIND "
+            f"{settings.api_bind!r}"
+        )
+    s2 = server.get("s2")
+    if not isinstance(s2, dict):
+        raise DemoError("server config must contain an s2 object")
+    if set(s2) != {
+        "access_token",
+        "account_endpoint",
+        "basin_endpoint",
+        "basin",
+        "stream_prefix",
+    }:
+        raise DemoError("server s2 config has missing or unknown fields")
+    for key in ("access_token", "account_endpoint", "basin_endpoint", "basin", "stream_prefix"):
+        _required_string(s2, key, "server s2 config")
+    if s2.get("account_endpoint") != S2_ENDPOINT or s2.get("basin_endpoint") != S2_ENDPOINT:
+        raise DemoError("server S2 endpoints must both be http://127.0.0.1:8080")
+    if s2.get("basin") != "tsk-sync-demo" or s2.get("stream_prefix") != "workspace-":
+        raise DemoError("server S2 basin or stream prefix does not match the managed demo")
+    tokens = server.get("tokens")
+    if not isinstance(tokens, list) or not tokens:
+        raise DemoError("server config tokens must be a non-empty array")
+    seen_bearers: set[str] = set()
+    seen_actors: set[str] = set()
+    for record in tokens:
+        if not isinstance(record, dict) or set(record) != {"bearer", "actor_id", "workspaces"}:
+            raise DemoError("server token records have missing or unknown fields")
+        actor = _required_string(record, "actor_id", "server token")
+        bearer = _required_string(record, "bearer", f"server actor {actor}")
+        workspaces = record.get("workspaces")
+        if actor in {".", ".."} or not IDENTIFIER.fullmatch(actor):
+            raise DemoError(f"invalid server actor identifier {actor!r}")
+        if actor in seen_actors:
+            raise DemoError("server actor identifiers must be distinct")
+        seen_actors.add(actor)
+        if bearer in seen_bearers or any(character.isspace() for character in bearer):
+            raise DemoError("server bearer values must be distinct and contain no whitespace")
+        seen_bearers.add(bearer)
+        if not isinstance(workspaces, list) or not workspaces:
+            raise DemoError(f"server actor {actor!r} must have non-empty workspaces")
+        if not all(
+            isinstance(value, str)
+            and value not in {".", ".."}
+            and IDENTIFIER.fullmatch(value)
+            for value in workspaces
+        ):
+            raise DemoError(f"server actor {actor!r} has an invalid workspace")
+    for actor, authorized in (
+        (settings.actor_a, True),
+        (settings.actor_b, True),
+        (settings.outsider_actor, False),
+    ):
+        record = _server_token(server, actor)
+        workspaces = record["workspaces"]
+        if authorized and settings.workspace not in workspaces:
+            raise DemoError(f"server actor {actor!r} is not authorized for {settings.workspace!r}")
+        if not authorized and settings.workspace in workspaces:
+            raise DemoError(f"outsider actor {actor!r} must not belong to {settings.workspace!r}")
+    if _contains_placeholder(server):
+        raise DemoError("server config contains placeholder values")
+
+
+def _expected_client(
+    settings: Settings, server: dict[str, Any], actor: str, project_path: pathlib.Path
+) -> dict[str, Any]:
+    return {
+        "endpoint": settings.endpoint,
+        "workspace": settings.workspace,
+        "bearer": _required_string(_server_token(server, actor), "bearer", f"server actor {actor}"),
+        "projects": [
+            {
+                "id": PROJECT_ID,
+                "name": PROJECT_NAME,
+                "path": str(project_path),
+            }
+        ],
+    }
+
+
+def validate_client_config(
+    client: dict[str, Any],
+    expected: dict[str, Any],
+    label: str,
+) -> None:
+    if set(client) != {"endpoint", "workspace", "bearer", "projects"}:
+        raise DemoError(f"{label} has missing or unknown top-level fields")
+    for key in ("endpoint", "workspace", "bearer"):
+        if client.get(key) != expected[key]:
+            if key == "bearer":
+                raise DemoError(f"{label} bearer does not match its server actor")
+            raise DemoError(f"{label} {key} does not match the managed demo")
+    projects = client.get("projects")
+    if (
+        not isinstance(projects, list)
+        or len(projects) != 1
+        or not isinstance(projects[0], dict)
+        or set(projects[0]) != {"id", "name", "path"}
+        or projects != expected["projects"]
+    ):
+        raise DemoError(f"{label} project mapping does not match the managed demo")
+    if _contains_placeholder(client):
+        raise DemoError(f"{label} contains placeholder values")
+
+
+def new_server_config(settings: Settings) -> dict[str, Any]:
+    generated = [secrets.token_urlsafe(32) for _ in range(4)]
+    return {
+        "bind": settings.api_bind,
+        "s2": {
+            "access_token": generated[0],
+            "account_endpoint": S2_ENDPOINT,
+            "basin_endpoint": S2_ENDPOINT,
+            "basin": "tsk-sync-demo",
+            "stream_prefix": "workspace-",
+        },
+        "tokens": [
+            {
+                "bearer": generated[1],
+                "actor_id": settings.actor_a,
+                "workspaces": [settings.workspace],
+            },
+            {
+                "bearer": generated[2],
+                "actor_id": settings.actor_b,
+                "workspaces": [settings.workspace],
+            },
+            {
+                "bearer": generated[3],
+                "actor_id": settings.outsider_actor,
+                "workspaces": [settings.outsider_workspace],
+            },
+        ],
+    }
+
+
+def ensure_server_config(settings: Settings) -> dict[str, Any]:
+    if _path_exists(settings.server_config):
+        server = read_private_json(
+            settings.server_config, "server config", settings.uid
+        )
+        validate_server_config(server, settings)
+        return server
+    ensure_owned_directory(settings, settings.server_config.parent, 0o700)
+    server = new_server_config(settings)
+    try:
+        create_private_json(settings, settings.server_config, server)
+    except FileExistsError:
+        server = read_private_json(
+            settings.server_config, "server config", settings.uid
+        )
+    validate_server_config(server, settings)
+    return server
+
+
+def ensure_client_config(
+    settings: Settings,
+    server: dict[str, Any],
+    actor: str,
+    state_dir: pathlib.Path,
+    project_path: pathlib.Path,
+    label: str,
+) -> dict[str, Any]:
+    ensure_private_directory(state_dir)
+    expected = _expected_client(settings, server, actor, project_path)
+    path = state_dir / "sync.json"
+    if _path_exists(path):
+        client = read_private_json(path, label, settings.uid)
+        validate_client_config(client, expected, label)
+        return client
+    try:
+        atomic_create(path, _json_bytes(expected), 0o600)
+    except FileExistsError:
+        pass
+    client = read_private_json(path, label, settings.uid)
+    validate_client_config(client, expected, label)
+    return client
+
+
+def load_configuration(settings: Settings, *, enforce_bind: bool = False) -> Configuration:
+    server = read_private_json(
+        settings.server_config, "server config", settings.uid
+    )
+    validate_server_config(server, settings, enforce_bind=enforce_bind)
+    expected_a = _expected_client(settings, server, settings.actor_a, settings.project_a_dir)
+    expected_b = _expected_client(settings, server, settings.actor_b, settings.project_b_dir)
+    client_a = read_private_json(
+        settings.client_a_dir / "sync.json", "client A config", settings.uid
+    )
+    client_b = read_private_json(
+        settings.client_b_dir / "sync.json", "client B config", settings.uid
+    )
+    validate_client_config(client_a, expected_a, "client A config")
+    validate_client_config(client_b, expected_b, "client B config")
+    redactor = SecretRedactor()
+    for document in (server, client_a, client_b):
+        redactor.collect(document)
+    return Configuration(server, client_a, client_b, redactor.secrets)
+
+
+def ensure_git_directory(path: pathlib.Path) -> None:
+    ensure_private_directory(path)
+    dot_git = path / ".git"
+    if dot_git.is_symlink():
+        raise DemoError(f"refusing symlink {dot_git}")
+    probe = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if probe.returncode == 0:
+        try:
+            top = pathlib.Path(probe.stdout.strip()).resolve()
+        except OSError as error:
+            raise DemoError(f"cannot resolve git root for {path}: {error}") from error
+        if top != path.resolve():
+            raise DemoError(f"{path} is inside another git checkout instead of being its root")
+        return
+    completed = subprocess.run(
+        ["git", "-C", str(path), "init", "-q"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise DemoError(f"cannot initialize git directory {path}: {completed.stderr.strip()}")
+
+
+def _command_path(name: str, settings: Settings | None = None) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    if name == "s2" and settings is not None:
+        candidate = settings.home / ".local/bin/s2"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _run_checked(
+    command: Sequence[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: float = 180.0,
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        list(command),
+        cwd=cwd,
+        env=None if env is None else dict(env),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise DemoError(f"command failed ({' '.join(command)}): {detail}")
+    return completed
+
+
+def _systemctl_root(arguments: Sequence[str], timeout: float = 180.0) -> None:
+    _run_checked([*_root_prefix(), _trusted_executable("systemctl"), *arguments], timeout=timeout)
+
+
+def _s2_cli_matches(settings: Settings) -> bool:
+    current = _command_path("s2", settings)
+    if current is None:
+        return False
+    completed = subprocess.run(
+        [current, "--version"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+        check=False,
+    )
+    return (
+        completed.returncode == 0
+        and EXPECTED_S2_VERSION in completed.stdout
+        and EXPECTED_S2_REVISION in completed.stdout
+    )
+
+
+def _preflight_tools(settings: Settings, no_build: bool) -> None:
+    if sys.version_info < (3, 11):
+        raise DemoError("Python 3.11 or newer is required")
+    required = ["git", "docker", "systemctl"]
+    if not no_build:
+        required.extend(["cargo", "rustup"])
+    if not _s2_cli_matches(settings):
+        required.extend(["curl", "sha256sum", "unzip"])
+    missing = [name for name in required if not _command_path(name, settings)]
+    if missing:
+        raise DemoError(f"missing required tools: {', '.join(sorted(set(missing)))}")
+    docker = _command_path("docker")
+    assert docker is not None
+    _run_checked([docker, "info"], timeout=30)
+    if no_build:
+        for binary in (settings.tsk_binary, settings.sync_binary):
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                raise DemoError(f"--no-build requires an executable {binary}")
+
+
+def _check_setup_paths(settings: Settings) -> None:
+    for root in (settings.server_config.parent, settings.demo_root, settings.systemd_dir):
+        _reject_symlink_components(root)
+    for path, kind in (
+        (settings.demo_root, "directory"),
+        (settings.client_a_dir, "directory"),
+        (settings.client_b_dir, "directory"),
+        (settings.project_a_dir, "directory"),
+        (settings.project_b_dir, "directory"),
+        (settings.server_config, "file"),
+        (settings.client_a_dir / "sync.json", "file"),
+        (settings.client_b_dir / "sync.json", "file"),
+    ):
+        _reject_symlink_or_wrong_type(path, kind)
+
+
+def _check_existing_configuration(settings: Settings) -> None:
+    server_exists = _path_exists(settings.server_config)
+    client_paths = (
+        settings.client_a_dir / "sync.json",
+        settings.client_b_dir / "sync.json",
+    )
+    if not server_exists and any(_path_exists(path) for path in client_paths):
+        raise DemoError("client config exists but server config is absent; refusing new mismatched secrets")
+    if not server_exists:
+        return
+    server = read_private_json(
+        settings.server_config, "server config", settings.uid
+    )
+    validate_server_config(server, settings)
+    for path, actor, project, label in (
+        (client_paths[0], settings.actor_a, settings.project_a_dir, "client A config"),
+        (client_paths[1], settings.actor_b, settings.project_b_dir, "client B config"),
+    ):
+        if _path_exists(path):
+            client = read_private_json(path, label, settings.uid)
+            validate_client_config(client, _expected_client(settings, server, actor, project), label)
+
+
+def _read_regular_text(path: pathlib.Path) -> str | None:
+    metadata = _reject_symlink_or_wrong_type(path, "file")
+    if metadata is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise DemoError(f"cannot read {path}: {error}") from error
+
+
+def _check_unit_dropins(settings: Settings) -> None:
+    roots = {
+        settings.systemd_dir,
+        pathlib.Path("/run/systemd/system"),
+        pathlib.Path("/usr/lib/systemd/system"),
+        pathlib.Path("/lib/systemd/system"),
+    }
+    for unit in (settings.api_service, settings.s2_service):
+        for root in roots:
+            directory = root / f"{unit}.d"
+            metadata = _reject_symlink_or_wrong_type(directory, "directory")
+            if metadata is None:
+                continue
+            entries = sorted(directory.iterdir())
+            if entries:
+                raise DemoError(
+                    f"refusing systemd drop-in collision under {directory}; "
+                    "remove or review it before setup"
+                )
+
+
+def _check_container_collision() -> None:
+    docker = shutil.which("docker") or "docker"
+    completed = subprocess.run(
+        [docker, "inspect", S2_CONTAINER],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return
+    try:
+        inspected = json.loads(completed.stdout)
+        container = inspected[0]
+        image = container["Config"]["Image"]
+        mounts = container["Mounts"]
+        bindings = container["HostConfig"]["PortBindings"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+        raise DemoError(f"cannot validate existing Docker container {S2_CONTAINER}") from error
+    expected_mount = any(
+        isinstance(mount, dict)
+        and mount.get("Type") == "volume"
+        and mount.get("Name") == S2_VOLUME
+        and mount.get("Destination") == "/data"
+        for mount in mounts
+    )
+    published = bindings.get("8080/tcp") if isinstance(bindings, dict) else None
+    loopback_publish = isinstance(published, list) and published and all(
+        isinstance(record, dict) and _is_loopback_host(record.get("HostIp"))
+        for record in published
+    )
+    if image != EXPECTED_S2_IMAGE or not expected_mount or not loopback_publish:
+        raise DemoError(
+            f"refusing unrelated Docker container collision named {S2_CONTAINER}"
+        )
+
+
+def _check_unit_collisions(settings: Settings, replace_unknown: bool) -> None:
+    for path in (settings.api_unit_path, settings.s2_unit_path):
+        existing = _read_regular_text(path)
+        if existing is not None and MANAGED_MARKER not in existing and not replace_unknown:
+            raise DemoError(
+                f"refusing unmanaged systemd unit collision at {path}; "
+                "rerun setup with --replace-managed-units after reviewing it"
+            )
+
+
+def preflight_setup(settings: Settings, no_build: bool, replace_unknown: bool) -> None:
+    _preflight_tools(settings, no_build)
+    _check_container_collision()
+    _check_setup_paths(settings)
+    _check_existing_configuration(settings)
+    _check_unit_collisions(settings, replace_unknown)
+    _check_unit_dropins(settings)
+    for path in (settings.project_a_dir, settings.project_b_dir):
+        if _path_exists(path / ".git") and (path / ".git").is_symlink():
+            raise DemoError(f"refusing symlink {path / '.git'}")
+
+
+def install_s2_cli(settings: Settings) -> None:
+    if _s2_cli_matches(settings):
+        return
+    installer = settings.repo / "scripts/install-s2-lite.sh"
+    _run_checked([str(installer)], cwd=settings.repo, timeout=300)
+    installed = settings.home / ".local/bin/s2"
+    completed = _run_checked([str(installed), "--version"], timeout=20)
+    if EXPECTED_S2_VERSION not in completed.stdout or EXPECTED_S2_REVISION not in completed.stdout:
+        raise DemoError("the installed S2 CLI does not match the repository pin")
+
+
+def build_release(settings: Settings) -> None:
+    _run_checked(["cargo", "build", "--release", "--locked"], cwd=settings.repo, timeout=900)
+    for binary in (settings.tsk_binary, settings.sync_binary):
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise DemoError(f"release build did not produce executable {binary}")
+
+
+def ensure_volume() -> bool:
+    docker = shutil.which("docker") or "docker"
+    probe = subprocess.run(
+        [docker, "volume", "inspect", S2_VOLUME],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if probe.returncode == 0:
+        return False
+    _run_checked([docker, "volume", "create", S2_VOLUME], timeout=60)
+    _run_checked(
+        [
+            docker,
+            "run",
+            "--rm",
+            "-v",
+            f"{S2_VOLUME}:/data",
+            VOLUME_INIT_IMAGE,
+            "sh",
+            "-c",
+            "chown -R 65532:65532 /data && chmod 700 /data",
+        ],
+        timeout=180,
+    )
+    return True
+
+
+def _systemd_path(value: str) -> str:
+    if not value.startswith("/") or any(
+        character.isspace() or character in {'"', "\\", "$", "%"}
+        for character in value
+    ):
+        raise DemoError(
+            "managed systemd paths must be absolute and contain no whitespace or shell/systemd escapes"
+        )
+    return value
+
+
+def _systemd_quote(value: str) -> str:
+    if "\n" in value or "\r" in value or "\x00" in value:
+        raise DemoError("paths used in systemd units must not contain control characters")
+    escaped = value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'"{escaped}"'
+
+
+def render_s2_unit(settings: Settings, docker: str) -> str:
+    return f"""{MANAGED_MARKER}
+[Unit]
+Description=TSK S2 Lite event store
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=2
+ExecStartPre=-{docker} rm -f {S2_CONTAINER}
+ExecStart={docker} run --rm --name {S2_CONTAINER} -p 127.0.0.1:8080:8080 -v {S2_VOLUME}:/data {EXPECTED_S2_IMAGE} lite --port 8080 --local-root /data --path tsk --no-cors
+ExecStop={docker} stop -t 20 {S2_CONTAINER}
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def render_api_unit(settings: Settings) -> str:
+    return f"""{MANAGED_MARKER}
+[Unit]
+Description=TSK shared-workspace sync API
+After=network-online.target {settings.s2_service}
+Requires={settings.s2_service}
+
+[Service]
+Type=simple
+User={settings.user}
+Group={settings.group}
+WorkingDirectory={_systemd_path(str(settings.repo))}
+Environment=RUST_BACKTRACE=1
+Environment=TSK_SYNC_ENABLE_FAILURE_INJECTION=0
+ExecStart={_systemd_quote(str(settings.sync_binary))} {_systemd_quote(str(settings.server_config))}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths={_systemd_path(str(settings.server_config))}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def install_managed_unit(
+    settings: Settings,
+    path: pathlib.Path,
+    contents: str,
+    replace_unknown: bool,
+) -> bool:
+    existing = _read_regular_text(path)
+    if existing is not None:
+        if MANAGED_MARKER not in existing and not replace_unknown:
+            raise DemoError(f"refusing unmanaged unit collision at {path}")
+        if existing == contents:
+            return False
+    replace_system_file(settings, path, contents.encode("utf-8"))
+    return True
+
+
+def install_units(settings: Settings, replace_unknown: bool) -> bool:
+    ensure_owned_directory(settings, settings.systemd_dir, 0o755)
+    docker = _trusted_executable("docker")
+    changed_s2 = install_managed_unit(
+        settings,
+        settings.s2_unit_path,
+        render_s2_unit(settings, docker),
+        replace_unknown,
+    )
+    changed_api = install_managed_unit(
+        settings,
+        settings.api_unit_path,
+        render_api_unit(settings),
+        replace_unknown,
+    )
+    return changed_s2 or changed_api
+
+
+def _wait_for_tcp(host: str, port: int, timeout: float = 45.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_error = "endpoint did not answer"
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return
+        except OSError as error:
+            last_error = str(error)
+            time.sleep(0.4)
+    raise DemoError(f"endpoint {host}:{port} did not become reachable: {last_error}")
+
+
+def _http_request(
+    endpoint: str,
+    method: str,
+    relative: str,
+    token: str | None = None,
+    body: Any | None = None,
+    headers: Mapping[str, str] | None = None,
+    timeout: float = 8.0,
+) -> tuple[int, Any]:
+    request_headers = {"Accept": "application/json"}
+    if token is not None:
+        request_headers["Authorization"] = f"Bearer {token}"
+    if headers:
+        request_headers.update(headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        urllib.parse.urljoin(endpoint, relative.lstrip("/")),
+        data=data,
+        headers=request_headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            status_code = response.status
+    except urllib.error.HTTPError as error:
+        status_code = error.code
+        raw = error.read()
+    try:
+        decoded = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        decoded = raw.decode("utf-8", errors="replace")
+    return status_code, decoded
+
+
+def wait_for_health(settings: Settings, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_error = "service did not answer"
+    while time.monotonic() < deadline:
+        try:
+            status_code, body = _http_request(settings.endpoint, "GET", "health", timeout=2)
+            if status_code == 200 and isinstance(body, dict) and body.get("status") == "ok":
+                return
+            last_error = f"HTTP {status_code}"
+        except OSError as error:
+            last_error = str(error)
+        time.sleep(0.4)
+    raise DemoError(f"sync API did not become healthy: {last_error}")
+
+
+def start_services(settings: Settings, units_changed: bool, binaries_rebuilt: bool) -> None:
+    if units_changed:
+        _systemctl_root(["daemon-reload"])
+    _systemctl_root(["enable", "--now", settings.s2_service], timeout=240)
+    if units_changed:
+        _systemctl_root(["restart", settings.s2_service], timeout=240)
+    _wait_for_tcp("127.0.0.1", 8080, timeout=90)
+    _systemctl_root(["enable", "--now", settings.api_service], timeout=180)
+    if units_changed or binaries_rebuilt:
+        restart_api_and_wait(settings)
+    else:
+        wait_for_health(settings)
+
+
+def _assert_status(actual: int, expected: int, label: str) -> None:
+    if actual != expected:
+        raise DemoError(f"{label}: expected HTTP {expected}, got {actual}")
+
+
+class Doctor:
+    def __init__(self, settings: Settings, allow_non_loopback: bool) -> None:
+        self.settings = settings
+        self.allow_non_loopback = allow_non_loopback
+        self.results: list[CheckResult] = []
+        self.redactor = SecretRedactor()
+        self.configuration: Configuration | None = None
+
+    def run_check(self, name: str, function: Callable[[], str | None]) -> None:
+        try:
+            detail = function() or ""
+        except Exception as error:
+            self.results.append(CheckResult(name, "FAIL", self.redactor.sanitize(error)))
+        else:
+            self.results.append(CheckResult(name, "PASS", self.redactor.sanitize(detail)))
+
+    def config(self) -> Configuration:
+        if self.configuration is None:
+            self.configuration = load_configuration(self.settings)
+            for value in self.configuration.secrets:
+                self.redactor.secrets.add(value)
+        return self.configuration
+
+    def check_tools(self) -> str:
+        missing = [
+            name
+            for name in ("git", "docker", "systemctl", "cargo", "rustup", "s2")
+            if not _command_path(name, self.settings)
+        ]
+        if missing:
+            raise DemoError(f"missing tools: {', '.join(missing)}")
+        for binary in (self.settings.tsk_binary, self.settings.sync_binary):
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                raise DemoError(f"missing executable release binary: {binary}")
+        return "required tools and release binaries are present"
+
+    def check_pins(self) -> str:
+        cargo = (self.settings.repo / "Cargo.toml").read_text(encoding="utf-8")
+        if f's2-sdk = {{ version = "={EXPECTED_SDK_VERSION}"' not in cargo:
+            raise DemoError(f"Cargo.toml does not pin s2-sdk {EXPECTED_SDK_VERSION}")
+        installer = (self.settings.repo / "scripts/install-s2-lite.sh").read_text(encoding="utf-8")
+        if f"VERSION={EXPECTED_S2_VERSION}" not in installer:
+            raise DemoError("the S2 installer version does not match the demo pin")
+        s2 = _command_path("s2", self.settings)
+        assert s2 is not None
+        version = _run_checked([s2, "--version"], timeout=20).stdout
+        if EXPECTED_S2_VERSION not in version or EXPECTED_S2_REVISION not in version:
+            raise DemoError("the installed S2 CLI does not match the pinned version and revision")
+        docker = shutil.which("docker") or "docker"
+        image = _run_checked(
+            [docker, "inspect", S2_CONTAINER, "--format", "{{.Config.Image}}"], timeout=20
+        ).stdout.strip()
+        if image != EXPECTED_S2_IMAGE:
+            raise DemoError("the running S2 Lite container does not use the pinned image digest")
+        return f"S2 {EXPECTED_S2_VERSION}, Lite digest, and SDK {EXPECTED_SDK_VERSION} are pinned"
+
+    def check_private_files(self) -> str:
+        configuration = self.config()
+        for path in (
+            self.settings.server_config,
+            self.settings.client_a_dir / "sync.json",
+            self.settings.client_b_dir / "sync.json",
+        ):
+            metadata = path.lstat()
+            if stat.S_IMODE(metadata.st_mode) != 0o600:
+                raise DemoError(f"private config mode changed from 0600: {path}")
+        if _contains_placeholder(configuration.server):
+            raise DemoError("server config contains placeholders")
+        return "server and client configs are regular 0600 files without placeholders"
+
+    def check_identities_and_mapping(self) -> str:
+        configuration = self.config()
+        if configuration.client_a["bearer"] == configuration.client_b["bearer"]:
+            raise DemoError("client identities are not distinct")
+        if self.settings.client_a_dir.resolve() == self.settings.client_b_dir.resolve():
+            raise DemoError("client state paths are not distinct")
+        if self.settings.project_a_dir.resolve() == self.settings.project_b_dir.resolve():
+            raise DemoError("project paths are not distinct")
+        for path in (self.settings.project_a_dir, self.settings.project_b_dir):
+            if path.is_symlink() or not path.is_dir():
+                raise DemoError(f"mapped project path is not a real directory: {path}")
+            probe = _run_checked(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
+            if pathlib.Path(probe.stdout.strip()).resolve() != path.resolve():
+                raise DemoError(f"mapped project is not a git root: {path}")
+        mapping_a = configuration.client_a["projects"][0]
+        mapping_b = configuration.client_b["projects"][0]
+        if (mapping_a["id"], mapping_a["name"]) != (mapping_b["id"], mapping_b["name"]):
+            raise DemoError("clients do not share one stable project identity")
+        return f"distinct actors and paths share project UUID {PROJECT_ID}"
+
+    def check_endpoint_policy(self) -> str:
+        configuration = self.config()
+        s2 = configuration.server["s2"]
+        for label in ("account_endpoint", "basin_endpoint"):
+            parsed = urllib.parse.urlparse(s2[label])
+            if not _is_loopback_host(parsed.hostname):
+                raise DemoError(f"S2 {label} is not loopback-only")
+        bind_address, _ = _parse_bind(configuration.server["bind"])
+        endpoint_host = urllib.parse.urlparse(self.settings.endpoint).hostname
+        if not self.allow_non_loopback and (
+            not bind_address.is_loopback or not _is_loopback_host(endpoint_host)
+        ):
+            raise DemoError(
+                "API bind and client endpoint must be loopback-only; "
+                "use doctor --allow-non-loopback only after reviewing exposure"
+            )
+        docker = shutil.which("docker") or "docker"
+        bindings_text = _run_checked(
+            [
+                docker,
+                "inspect",
+                S2_CONTAINER,
+                "--format",
+                "{{json .HostConfig.PortBindings}}",
+            ],
+            timeout=20,
+        ).stdout.strip()
+        bindings = json.loads(bindings_text)
+        records = bindings.get("8080/tcp") if isinstance(bindings, dict) else None
+        if not isinstance(records, list) or not records:
+            raise DemoError("running S2 container does not publish 8080/tcp")
+        if any(not _is_loopback_host(record.get("HostIp")) for record in records if isinstance(record, dict)):
+            raise DemoError("running S2 container publishes a non-loopback host port")
+        policy = "reviewed non-loopback allowed" if self.allow_non_loopback else "loopback-only"
+        return f"S2 is loopback-only; API policy is {policy}"
+
+    def check_systemd(self) -> str:
+        for unit in (self.settings.s2_service, self.settings.api_service):
+            completed = subprocess.run(
+                ["systemctl", "is-active", "--quiet", unit], check=False
+            )
+            if completed.returncode != 0:
+                raise DemoError(f"systemd unit is not active: {unit}")
+        return f"{self.settings.s2_service} and {self.settings.api_service} are active"
+
+    def check_failure_injection(self) -> str:
+        configuration = self.config()
+        environment = _run_checked(
+            [
+                "systemctl",
+                "show",
+                self.settings.api_service,
+                "--property=Environment",
+                "--value",
+            ],
+            timeout=20,
+        ).stdout.split()
+        for assignment in environment:
+            if assignment.startswith("TSK_SYNC_FAILURE=") and assignment != "TSK_SYNC_FAILURE=":
+                raise DemoError("TSK_SYNC_FAILURE is permanently configured")
+            if assignment.startswith("TSK_SYNC_ENABLE_FAILURE_INJECTION="):
+                value = assignment.split("=", 1)[1]
+                if value == "1" or value.lower() == "true":
+                    raise DemoError("failure injection is enabled in the running API service")
+        token = configuration.client_a["bearer"]
+        snapshot_status, snapshot = _http_request(
+            self.settings.endpoint,
+            "GET",
+            f"v1/workspaces/{urllib.parse.quote(self.settings.workspace)}/snapshot",
+            token,
+        )
+        _assert_status(snapshot_status, 200, "failure-injection snapshot probe")
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("state"), dict):
+            raise DemoError("failure-injection snapshot probe returned an invalid document")
+        harmless_invalid_request = {
+            "operation_id": str(uuid.uuid4()),
+            "expected": [],
+            "changes": [],
+            "proposed_state": snapshot["state"],
+        }
+        status_code, _ = _http_request(
+            self.settings.endpoint,
+            "POST",
+            f"v1/workspaces/{urllib.parse.quote(self.settings.workspace)}/mutations",
+            token,
+            harmless_invalid_request,
+            {"x-tsk-sync-failure": "lost_response_after_append"},
+        )
+        _assert_status(status_code, 403, "failure-injection probe")
+        return "failure injection is disabled in systemd and rejected by the API"
+
+    def check_health_and_auth(self) -> str:
+        configuration = self.config()
+        health_status, health = _http_request(self.settings.endpoint, "GET", "health")
+        _assert_status(health_status, 200, "health")
+        if not isinstance(health, dict) or health.get("status") != "ok":
+            raise DemoError("health response is not {status: ok}")
+        workspace = urllib.parse.quote(self.settings.workspace)
+        snapshot_path = f"v1/workspaces/{workspace}/snapshot"
+        for label, token in (
+            ("client A", configuration.client_a["bearer"]),
+            ("client B", configuration.client_b["bearer"]),
+        ):
+            status_code, body = _http_request(self.settings.endpoint, "GET", snapshot_path, token)
+            _assert_status(status_code, 200, f"{label} authenticated snapshot")
+            if not isinstance(body, dict) or body.get("workspace") != self.settings.workspace:
+                raise DemoError(f"{label} snapshot returned the wrong workspace")
+        status_code, _ = _http_request(self.settings.endpoint, "GET", snapshot_path)
+        _assert_status(status_code, 401, "missing bearer")
+        status_code, _ = _http_request(
+            self.settings.endpoint, "GET", snapshot_path, f"invalid-{uuid.uuid4()}"
+        )
+        _assert_status(status_code, 401, "invalid bearer")
+        outsider = _server_token(configuration.server, self.settings.outsider_actor)["bearer"]
+        requests = (
+            ("GET", snapshot_path, None),
+            ("GET", f"v1/workspaces/{workspace}/events?from=0&limit=1", None),
+            ("POST", f"v1/workspaces/{workspace}/mutations", {}),
+        )
+        for method, path, body in requests:
+            denied, _ = _http_request(self.settings.endpoint, method, path, outsider, body)
+            _assert_status(denied, 403, f"outsider {method} {path.split('?')[0]}")
+        return "health, both authorized actors, 401, and outsider 403 behavior are correct"
+
+    def run(self) -> list[CheckResult]:
+        self.run_check("tools and release binaries", self.check_tools)
+        self.run_check("pinned S2 CLI/image and Rust SDK", self.check_pins)
+        self.run_check("private configuration", self.check_private_files)
+        self.run_check("distinct identities, paths, and project mapping", self.check_identities_and_mapping)
+        self.run_check("loopback exposure policy", self.check_endpoint_policy)
+        self.run_check("systemd services active", self.check_systemd)
+        self.run_check("failure injection disabled", self.check_failure_injection)
+        self.run_check("health and authorization behavior", self.check_health_and_auth)
+        return self.results
+
+
+def print_doctor(results: Sequence[CheckResult], as_json: bool) -> int:
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "checks": [dataclasses.asdict(result) for result in results],
+                    "pass": sum(result.outcome == "PASS" for result in results),
+                    "fail": sum(result.outcome == "FAIL" for result in results),
+                },
+                indent=2,
+            )
+        )
+    else:
+        print("tsk sync doctor")
+        print("=" * 15)
+        for result in results:
+            suffix = f" — {result.detail}" if result.detail else ""
+            print(f"{result.outcome:4} {result.name}{suffix}")
+        failures = sum(result.outcome == "FAIL" for result in results)
+        print(f"\nPASS={len(results) - failures} FAIL={failures}")
+    return 1 if any(result.outcome == "FAIL" for result in results) else 0
+
+
+def run_doctor(settings: Settings, as_json: bool, allow_non_loopback: bool) -> int:
+    return print_doctor(Doctor(settings, allow_non_loopback).run(), as_json)
+
+
+def command_setup(settings: Settings, args: argparse.Namespace) -> int:
+    print("Preflight...")
+    preflight_setup(settings, args.no_build, args.replace_managed_units)
+    ensure_private_directory(settings.demo_root)
+    ensure_git_directory(settings.project_a_dir)
+    ensure_git_directory(settings.project_b_dir)
+
+    server = ensure_server_config(settings)
+    ensure_client_config(
+        settings,
+        server,
+        settings.actor_a,
+        settings.client_a_dir,
+        settings.project_a_dir,
+        "client A config",
+    )
+    ensure_client_config(
+        settings,
+        server,
+        settings.actor_b,
+        settings.client_b_dir,
+        settings.project_b_dir,
+        "client B config",
+    )
+    print("Private server and client configuration is ready (secret values not shown).")
+
+    install_s2_cli(settings)
+    print(f"Pinned S2 CLI {EXPECTED_S2_VERSION} is ready.")
+    if not args.no_build:
+        print("Building locked release binaries...")
+        build_release(settings)
+    volume_created = ensure_volume()
+    print(f"Docker volume {S2_VOLUME} {'created' if volume_created else 'preserved'}.")
+    units_changed = install_units(settings, args.replace_managed_units)
+    print("Managed systemd units are installed.")
+
+    if args.no_start:
+        if units_changed:
+            _systemctl_root(["daemon-reload"])
+        print("Services were not started (--no-start); run scripts/sync-demo doctor after starting them.")
+        return 0
+
+    print("Starting services...")
+    start_services(settings, units_changed, binaries_rebuilt=not args.no_build)
+    bind_address, _ = _parse_bind(settings.api_bind)
+    return run_doctor(
+        settings,
+        as_json=False,
+        allow_non_loopback=not bind_address.is_loopback,
+    )
+
+
+def command_doctor(settings: Settings, args: argparse.Namespace) -> int:
+    return run_doctor(settings, args.json, args.allow_non_loopback)
+
+
+def _checker_command(settings: Settings, profile: str, allow_skips: bool) -> list[str]:
+    command = [
+        sys.executable,
+        str(settings.repo / "scripts/sync-demo-check.py"),
+        "--profile",
+        profile,
+        "--server-config",
+        str(settings.server_config),
+        "--client-a-dir",
+        str(settings.client_a_dir),
+        "--client-b-dir",
+        str(settings.client_b_dir),
+        "--tsk",
+        str(settings.tsk_binary),
+        "--base-url",
+        settings.endpoint,
+        "--api-service",
+        settings.api_service,
+        "--s2-service",
+        settings.s2_service,
+    ]
+    if not allow_skips:
+        command.append("--fail-on-skip")
+    return command
+
+
+def run_checker(settings: Settings, profile: str, allow_skips: bool) -> int:
+    environment = os.environ.copy()
+    local_bin = str(settings.home / ".local/bin")
+    environment["PATH"] = f"{local_bin}{os.pathsep}{environment.get('PATH', '')}"
+    completed = subprocess.run(
+        _checker_command(settings, profile, allow_skips),
+        cwd=settings.repo,
+        env=environment,
+        check=False,
+    )
+    return completed.returncode
+
+
+def _failure_dropin_path(settings: Settings) -> pathlib.Path:
+    return pathlib.Path("/run/systemd/system") / f"{settings.api_service}.d" / FAILURE_DROPIN
+
+
+def _failure_dropin_contents() -> str:
+    return (
+        f"{FAILURE_DROPIN_MARKER}\n"
+        "[Service]\n"
+        "Environment=TSK_SYNC_ENABLE_FAILURE_INJECTION=1\n"
+    )
+
+
+def _install_failure_dropin(settings: Settings) -> pathlib.Path:
+    path = _failure_dropin_path(settings)
+    contents = _failure_dropin_contents()
+    if _path_exists(path):
+        existing = _read_regular_text(path)
+        if existing != contents:
+            raise DemoError(f"refusing existing failure-injection drop-in: {path}")
+        return path
+    ensure_owned_directory(settings, path.parent, 0o755)
+    _run_root_file_helper("create", path, contents.encode("utf-8"), 0o644, 0, 0)
+    return path
+
+
+def _remove_failure_dropin(settings: Settings, path: pathlib.Path) -> None:
+    helper = r"""
+import os, pathlib, stat, sys
+path = pathlib.Path(sys.argv[1])
+expected = sys.stdin.buffer.read()
+try:
+    metadata = path.lstat()
+except FileNotFoundError:
+    raise SystemExit(0)
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("refusing unsafe failure-injection drop-in")
+if path.read_bytes() != expected:
+    raise SystemExit("failure-injection drop-in changed before cleanup")
+path.unlink()
+try:
+    path.parent.rmdir()
+except OSError:
+    pass
+"""
+    completed = subprocess.run(
+        [
+            *_root_prefix(),
+            _trusted_executable("python3"),
+            "-I",
+            "-c",
+            helper,
+            str(path),
+        ],
+        input=_failure_dropin_contents().encode("utf-8"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise DemoError(f"cannot remove temporary failure-injection drop-in: {detail}")
+
+
+def restart_api_and_wait(settings: Settings) -> None:
+    _systemctl_root(["reset-failed", settings.api_service])
+    _systemctl_root(["restart", settings.api_service])
+    wait_for_health(settings)
+
+
+def run_full_test(settings: Settings, allow_skips: bool) -> int:
+    path: pathlib.Path | None = None
+    result = 1
+    test_error: Exception | None = None
+    cleanup_error: Exception | None = None
+    try:
+        path = _install_failure_dropin(settings)
+        _systemctl_root(["daemon-reload"])
+        restart_api_and_wait(settings)
+        result = run_checker(settings, "full", allow_skips)
+    except Exception as error:
+        test_error = error
+    finally:
+        if path is not None:
+            try:
+                _remove_failure_dropin(settings, path)
+                _systemctl_root(["daemon-reload"])
+                restart_api_and_wait(settings)
+            except Exception as error:
+                cleanup_error = error
+    if cleanup_error is not None:
+        raise DemoError(f"full-test cleanup failed: {cleanup_error}") from cleanup_error
+    if test_error is not None:
+        raise test_error
+    return result
+
+
+def _read_pty(master: int, buffer: bytearray) -> None:
+    while True:
+        ready, _, _ = select.select([master], [], [], 0)
+        if not ready:
+            return
+        try:
+            chunk = os.read(master, 65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            return
+        if not chunk:
+            return
+        buffer.extend(chunk)
+        if len(buffer) > 2_000_000:
+            del buffer[:1_000_000]
+
+
+def _wait_pty_contains(master: int, buffer: bytearray, needle: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    encoded = needle.encode("utf-8")
+    while time.monotonic() < deadline:
+        _read_pty(master, buffer)
+        if encoded in buffer:
+            return True
+        time.sleep(0.05)
+    _read_pty(master, buffer)
+    return encoded in buffer
+
+
+def run_tui_test(settings: Settings) -> int:
+    if os.name != "posix" or not hasattr(os, "forkpty"):
+        raise DemoError("the TUI profile requires a POSIX PTY")
+    load_configuration(settings)
+    wait_for_health(settings)
+    title = f"sync-tui-pty-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    child_pid, master = os.forkpty()
+    if child_pid == 0:
+        try:
+            os.chdir(settings.project_b_dir)
+            environment = os.environ.copy()
+            environment["TSK_STATE_DIR"] = str(settings.client_b_dir)
+            environment["TSK_NO_UPDATE_CHECK"] = "1"
+            environment["TERM"] = "xterm-256color"
+            environment.pop("TSK_SYNC_CONFIG", None)
+            os.execve(settings.tsk_binary, [str(settings.tsk_binary)], environment)
+        except Exception as error:
+            os.write(2, f"cannot start tsk TUI: {error}\n".encode())
+            os._exit(127)
+    buffer = bytearray()
+    try:
+        os.set_blocking(master, False)
+        try:
+            import fcntl
+
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+        except (ImportError, OSError):
+            pass
+        if not _wait_pty_contains(master, buffer, "ON DECK", 12):
+            raise DemoError("the PTY TUI did not paint its board before the create")
+        # Pin a unique search before the remote create. Existing demo history can be much
+        # taller than the viewport; the empty pinned search makes the arriving task visible
+        # without moving the user's selection or relying on scroll position.
+        os.write(master, b"/" + title.encode("utf-8") + b"\r")
+        if not _wait_pty_contains(master, buffer, title, 8):
+            raise DemoError("the PTY TUI did not accept the unique pinned search")
+        buffer.clear()
+        completed = subprocess.run(
+            [
+                str(settings.tsk_binary),
+                "add",
+                "--state-dir",
+                str(settings.client_a_dir),
+                "--project",
+                str(settings.project_a_dir),
+                "--title",
+                title,
+                "--json",
+            ],
+            cwd=settings.repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+            env={key: value for key, value in os.environ.items() if key != "TSK_SYNC_CONFIG"},
+        )
+        if completed.returncode != 0:
+            raise DemoError(
+                f"client A create failed during PTY test: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        if not _wait_pty_contains(master, buffer, title, 30):
+            raise DemoError("the already-open client B TUI did not render client A's create")
+        print("PASS real PTY: an already-open client B TUI rendered client A's create")
+        return 0
+    finally:
+        try:
+            os.write(master, b"\x11")
+        except OSError:
+            pass
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            waited, _ = os.waitpid(child_pid, os.WNOHANG)
+            if waited == child_pid:
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(master)
+
+
+def command_test(settings: Settings, args: argparse.Namespace) -> int:
+    if args.profile == "smoke":
+        return run_checker(settings, "smoke", args.allow_skips)
+    if args.profile == "full":
+        if not args.yes_disruptive:
+            raise DemoError("the full profile restarts/crashes services; rerun with --yes-disruptive")
+        return run_full_test(settings, args.allow_skips)
+    return run_tui_test(settings)
+
+
+def command_status(settings: Settings, _args: argparse.Namespace) -> int:
+    completed = subprocess.run(
+        [
+            "systemctl",
+            "--no-pager",
+            "--full",
+            "status",
+            settings.s2_service,
+            settings.api_service,
+        ],
+        check=False,
+    )
+    return completed.returncode
+
+
+def command_restart(settings: Settings, args: argparse.Namespace) -> int:
+    if args.target in {"s2", "all"}:
+        _systemctl_root(["restart", settings.s2_service], timeout=240)
+        _wait_for_tcp("127.0.0.1", 8080, timeout=90)
+    if args.target in {"api", "all"}:
+        restart_api_and_wait(settings)
+    return 0
+
+
+def command_logs(settings: Settings, args: argparse.Namespace) -> int:
+    unit = settings.api_service if args.target == "api" else settings.s2_service
+    command = ["journalctl", "-u", unit]
+    if args.follow:
+        command.extend(["-n", "200", "--follow"])
+    else:
+        command.extend(["-n", "200", "--no-pager"])
+    return subprocess.run(command, check=False).returncode
+
+
+def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Set up, diagnose, and test the local two-client tsk sync demo."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    setup = subparsers.add_parser("setup", help="idempotently configure and start the demo")
+    setup.add_argument("--no-build", action="store_true", help="reuse existing release binaries")
+    setup.add_argument("--no-start", action="store_true", help="install but do not start services")
+    setup.add_argument(
+        "--replace-managed-units",
+        action="store_true",
+        help="replace colliding units after explicit review",
+    )
+
+    doctor = subparsers.add_parser("doctor", help="run read-only safety and health checks")
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument(
+        "--allow-non-loopback",
+        action="store_true",
+        help="accept a deliberately non-loopback API bind/endpoint",
+    )
+
+    test = subparsers.add_parser("test", help="run real-service acceptance profiles")
+    test.add_argument("--profile", required=True, choices=("smoke", "full", "tui"))
+    test.add_argument("--yes-disruptive", action="store_true")
+    test.add_argument("--allow-skips", action="store_true")
+
+    subparsers.add_parser("status", help="show both managed systemd services")
+
+    restart = subparsers.add_parser("restart", help="restart managed services")
+    restart.add_argument("target", choices=("api", "s2", "all"))
+
+    logs = subparsers.add_parser("logs", help="show managed service logs")
+    logs.add_argument("target", choices=("api", "s2"))
+    logs.add_argument("--follow", action="store_true")
+    return parser.parse_args(arguments)
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    try:
+        args = parse_args(arguments)
+        settings = Settings.from_environment()
+        handlers: dict[str, Callable[[Settings, argparse.Namespace], int]] = {
+            "setup": command_setup,
+            "doctor": command_doctor,
+            "test": command_test,
+            "status": command_status,
+            "restart": command_restart,
+            "logs": command_logs,
+        }
+        return handlers[args.command](settings, args)
+    except KeyboardInterrupt:
+        print("sync-demo: interrupted", file=sys.stderr)
+        return 130
+    except Exception as error:
+        print(f"sync-demo: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

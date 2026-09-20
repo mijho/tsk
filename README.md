@@ -131,7 +131,8 @@ See the [user guide](https://gettsk.sh/docs/) for installation, task management,
 agent setup, and the full CLI reference.
 
 The feature branch also includes a [self-hosted S2 multi-user prototype runbook](README-SYNC.md)
-with two-client setup, acceptance checks, service operations, and recovery steps.
+with `scripts/sync-demo` setup/doctor/test onboarding, two-client checks, service operations,
+and recovery steps.
 
 ## Contributing and security
 
