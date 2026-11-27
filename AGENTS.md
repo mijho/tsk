@@ -288,7 +288,8 @@ migration or design work they imply. What the behaviour *is* lives in the docs
   which decides the release under the save's lock on the merged state, never a stale copy.
   The done and every released start share one save and one undo entry.
 - A released assigned task's agent launches after that save; a failed launch puts the task
-  back to ready. The mechanism is in the doc comments of `src/dispatch.rs`.
+  back to ready, unless its status changed by hand since the release: then it keeps that
+  change. The mechanism is in the doc comments of `src/dispatch.rs`.
 - `after` is stored by task id; numbers are only its display and input form. A delete drops
   its id from every other task's `after` in the same undo entry (`UndoEntry::SetAfter`
   leaves); trash purge drops leftovers as bookkeeping. A prerequisite that is no longer a

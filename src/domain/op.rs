@@ -1346,4 +1346,24 @@ mod tests {
         assert!(apply(&mut state, 3, batch).unwrap().changed);
         assert_eq!(state.get(other).unwrap().status, HumanStatus::Started);
     }
+
+    /// Refusals the board and CLI print name tasks the way users do, never by raw id.
+    #[test]
+    fn op_refusals_read_without_raw_ids() {
+        let id = Uuid::from_u128(7);
+        let text = |error: ApplyError| error.to_string();
+        assert_eq!(
+            text(ApplyError::StaleRound(id)),
+            "that block or review changed elsewhere"
+        );
+        assert_eq!(
+            text(ApplyError::StaleDispatch(id)),
+            "that task's dispatch changed elsewhere"
+        );
+        let waiting = ApplyError::WaitingOn {
+            task: id,
+            prerequisites: vec![202, 205],
+        };
+        assert_eq!(text(waiting), "the task still waits on T202, T205");
+    }
 }

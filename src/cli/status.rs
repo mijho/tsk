@@ -1236,6 +1236,81 @@ mod start_tests {
         );
     }
 
+    /// A released task whose status changed by hand before its launch (blocked, then started
+    /// again) is no longer the release's: a launch still records its dispatch, unattributed,
+    /// and a failed one leaves the task started and says it did not launch.
+    #[test]
+    fn a_release_made_stale_before_its_launch_keeps_the_change() {
+        for refuse_launch in [false, true] {
+            let temp = Temp::new("released-stale");
+            let (first, second) = released_pair(&temp);
+            let mut state = temp.store().load().expect("load");
+            let id = |state: &DomainState, number| {
+                state
+                    .tasks()
+                    .iter()
+                    .find(|task| task.number == Some(number))
+                    .expect("task")
+                    .id
+            };
+            let (first_id, second_id) = (id(&state, first), id(&state, second));
+            let mut host = Host {
+                refuse_launch,
+                ..Host::default()
+            };
+            state.complete(first_id).expect("done");
+            let held = dispatch::plan_released_with_host(
+                &mut state,
+                OWNER,
+                HostKind::Herdr,
+                None,
+                &mut host,
+            );
+            assert!(held.is_empty(), "the launch is held for after the save");
+            for status in [HumanStatus::Blocked, HumanStatus::Started] {
+                state.set_status(second_id, status).expect("by hand");
+            }
+            let released = dispatch::launch_released_with_host(
+                &mut state,
+                &temp.0,
+                HostKind::Herdr,
+                &mut host,
+            );
+            let task = state.get(second_id).expect("task");
+            assert_eq!(task.status, HumanStatus::Started);
+            if refuse_launch {
+                assert!(task.dispatch.is_none());
+                assert!(
+                    matches!(
+                        released.as_slice(),
+                        [dispatch::Released {
+                            start: dispatch::ReleasedStart::NotLaunchedChanged(_),
+                            ..
+                        }]
+                    ),
+                    "{released:?}"
+                );
+                let message = dispatch::released_message(&released).expect("message");
+                assert!(
+                    message.contains(&format!("T{second} not launched")),
+                    "{message}"
+                );
+            } else {
+                assert!(
+                    task.dispatch.is_some(),
+                    "the launched agent keeps its record"
+                );
+                let event = task.history.last().expect("event");
+                assert_eq!(event.kind, crate::domain::TaskEventKind::Dispatched);
+                assert_eq!(
+                    event.detail.as_ref().and_then(|detail| detail.after),
+                    None,
+                    "no longer attributed to the release"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_failed_launch_keeps_the_released_task_ready_and_the_done() {
         let temp = Temp::new("released-failed");

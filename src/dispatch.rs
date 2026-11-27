@@ -3339,6 +3339,9 @@ pub enum ReleasedStart {
     Unrecorded(Box<DispatchResult>, String),
     /// The start itself failed: the task stays ready. The done stands.
     Failed(String),
+    /// The launch refused or failed after the task changed since its release (say it was
+    /// blocked and started again): it keeps that change, with no agent.
+    NotLaunchedChanged(String),
 }
 
 /// One task a completion released, and what its start did.
@@ -3479,11 +3482,11 @@ pub fn launch_released_with_host(
         });
         let start = match launched {
             Ok(result) => ReleasedStart::Dispatched(Box::new(result)),
-            Err(reason) => {
+            Err(reason) => match resolve(state, ReleasedLaunchOutcome::Failed) {
+                Ok(()) => ReleasedStart::BackToReady(reason),
                 // A task that changed since its release keeps that change.
-                let _ = resolve(state, ReleasedLaunchOutcome::Failed);
-                ReleasedStart::BackToReady(reason)
-            }
+                Err(_) => ReleasedStart::NotLaunchedChanged(reason),
+            },
         };
         released.push(Released {
             number,
@@ -3613,6 +3616,9 @@ pub fn released_message(released: &[Released]) -> Option<String> {
                     result.assignee, result.record.worktree
                 ),
                 ReleasedStart::Failed(reason) => format!("T{number} stays ready: {reason}"),
+                ReleasedStart::NotLaunchedChanged(reason) => {
+                    format!("T{number} not launched: {reason}")
+                }
             }
         })
         .collect();
