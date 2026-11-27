@@ -846,7 +846,7 @@ fn two_tsk_processes_on_one_state_dir_share_one_fetch() {
         ],
     );
     let state = r.root.join("state");
-    for title in ["first", "second"] {
+    let add = |title: &str| {
         let output = Command::new(env!("CARGO_BIN_EXE_tsk"))
             .args(["add", "--state-dir"])
             .arg(&state)
@@ -862,12 +862,18 @@ fn two_tsk_processes_on_one_state_dir_share_one_fetch() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
+    };
+    let contacts = || std::fs::read_to_string(&counter).unwrap().lines().count();
+    add("first");
+    // Older Git also contacts the remote to refresh its default branch.
+    let first_contacts = contacts();
+    assert_ne!(first_contacts, 0, "the first process contacts the remote");
     assert!(state.join("fetch-stamps.json").exists());
+    add("second");
     assert_eq!(
-        std::fs::read_to_string(&counter).unwrap().lines().count(),
-        1,
-        "the second process reuses the first one's fetch"
+        contacts(),
+        first_contacts,
+        "the second process does not contact the remote again"
     );
 }
 
