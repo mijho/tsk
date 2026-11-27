@@ -201,7 +201,17 @@ impl DispatchIntent {
                     .get(*prerequisite)
                     .ok_or(DomainError::UnknownId(*prerequisite))?;
                 let number = number_of(source)?;
-                let released_by_source = target.history.last().is_some_and(|event| {
+                // The release must be the task's latest status change. An unrelated edit
+                // since then (a title, a step) keeps the launch attributed to it.
+                let last_status = target.history.iter().rev().find(|event| {
+                    matches!(
+                        event.kind,
+                        TaskEventKind::StatusSet
+                            | TaskEventKind::Completed
+                            | TaskEventKind::Reopened
+                    )
+                });
+                let released_by_source = last_status.is_some_and(|event| {
                     event.kind == TaskEventKind::StatusSet
                         && event.detail.as_ref().is_some_and(|detail| {
                             detail.from == Some(HumanStatus::Ready)
@@ -528,6 +538,54 @@ mod tests {
             let task = state.get(id).unwrap();
             assert_eq!(task.status, HumanStatus::Ready);
             assert_eq!(task.dispatch.is_some(), success);
+        }
+    }
+
+    /// A write between the release's save and its launch, such as a title edit, does not
+    /// stop the outcome landing: a failed launch still goes back to ready.
+    #[test]
+    fn a_release_outcome_survives_an_unrelated_edit_since_the_release() {
+        let mut state = DomainState::new();
+        let prerequisite = task(&mut state, "prerequisite");
+        let id = task(&mut state, "waiting");
+        state.assign_numbers_for_persistence();
+        let number = state.get(prerequisite).unwrap().number.unwrap();
+        state.set_after(id, &[number]).unwrap();
+        state.set_status(id, HumanStatus::Ready).unwrap();
+        state.complete(prerequisite).unwrap();
+        let start = DispatchIntent::ReleaseStart {
+            task: id,
+            prerequisite,
+        };
+        assert!(start.apply(&mut state).unwrap().changed);
+        state.add_step(id, "added elsewhere").unwrap();
+        let expected_revision = state.get(id).unwrap().revision;
+        for outcome in [
+            ReleasedLaunchOutcome::Failed,
+            ReleasedLaunchOutcome::Succeeded {
+                record: Box::new(dispatch("released")),
+            },
+        ] {
+            let mut state = state.clone();
+            let success = matches!(&outcome, ReleasedLaunchOutcome::Succeeded { .. });
+            let resolve = DispatchIntent::ResolveReleasedLaunch {
+                task: id,
+                prerequisite,
+                expected_revision,
+                outcome,
+            };
+            assert!(resolve.apply(&mut state).unwrap().changed);
+            let task = state.get(id).unwrap();
+            let expected = if success {
+                HumanStatus::Started
+            } else {
+                HumanStatus::Ready
+            };
+            assert_eq!(task.status, expected);
+            if success {
+                let detail = task.history.last().unwrap().detail.as_ref().unwrap();
+                assert_eq!(detail.after, Some(number));
+            }
         }
     }
 }

@@ -1,9 +1,10 @@
 //! Replayable block, review, check, and reply mutations. No delivery or host calls.
 //!
 //! Legacy keys are scoped to a task/round: rounds use `BlockKey`, replies use exact
-//! `(by, at)`, and checks use exact text. Never serialize UI positions. Migrate these
-//! selectors (and creation) to persistent IDs when the store gains round/reply/check
-//! IDs; until then an ambiguous legacy selector must not pick a first match.
+//! `(by, at)`, and checks use exact text plus its occurrence in the round. Never
+//! serialize UI positions. Migrate these selectors (and creation) to persistent IDs when
+//! the store gains round/reply/check IDs; until then an ambiguous round or reply selector
+//! must not pick a first match.
 
 use std::collections::BTreeSet;
 use std::time::SystemTime;
