@@ -21,7 +21,8 @@ Set up this VM to develop tsk, then start the development loop.
    curl -fsSL https://gettsk.sh/install.sh | TSK_INSTALL_DIR="$HOME/.local/bin" sh
    Put ~/.local/bin on PATH. Run `tsk setup codex` so the tsk skill lands in
    ~/.agents/skills, which you read.
-4. From ~/tsk run scripts/sync-seed-tasks. It is safe to re-run.
+4. From ~/tsk run scripts/sync-seed-tasks. It is safe to re-run. If it reports missing
+   steps or prerequisites on an existing task, add them on the board and re-run.
 5. Read AGENTS.md, docs/sync/PLAN.md and docs/sync/PROCESS.md. PROCESS.md is how you work
    from now on: rounds, a fresh validator subagent per review, push to main, no PRs,
    rotation every fifth done task.

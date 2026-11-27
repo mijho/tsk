@@ -3,6 +3,7 @@
 
 usage: scripts/sync-seed-tasks [backlog.json]
 Uses `tsk` on PATH (override with TSK_BIN). Tasks go in this repo's project scope.
+Existing tasks are not edited. Missing steps or prerequisites are reported.
 """
 import json
 import os
@@ -19,18 +20,50 @@ def run(*args):
     return subprocess.run([tsk, *args], check=True, capture_output=True, text=True).stdout
 
 
+def task_index(*flags):
+    index = {}
+    for flag in flags:
+        args = [flag] if flag else []
+        for row in json.loads(run("list", "-p", str(repo), "--json", *args)):
+            key = (row["thread"], row["title"])
+            index.setdefault(key, set()).add(row["number"])
+    return index
+
+
+active = task_index(None, "--done")
+archived = task_index("--archived")
 numbers = {}
 for item in json.loads(backlog.read_text()):
-    args = ["add", "--json", "-p", str(repo), "-t", item["title"], "--thread", item["thread"]]
-    if item.get("notes"):
-        args += ["-n", item["notes"]]
-    result = json.loads(run(*args))
-    n = result["number"]
+    key = (item["thread"], item["title"])
+    matches = active.get(key) or archived.get(key) or set()
+    if len(matches) > 1:
+        choices = ", ".join(f"T{n}" for n in sorted(matches))
+        sys.exit(f"Multiple matches for {item['title']!r}: {choices}. Resolve them, then rerun.")
+    if matches:
+        n, = matches
+        outcome = "existing"
+    else:
+        args = ["add", "--json", "-p", str(repo), "-t", item["title"], "--thread", item["thread"]]
+        if item.get("notes"):
+            args += ["-n", item["notes"]]
+        result = json.loads(run(*args))
+        n, outcome = result["number"], result["outcome"]
+        active[key] = {n}
     numbers[item["key"]] = n
-    if result["outcome"] == "created":
-        for step in item.get("steps", []):
-            run("steps", f"T{n}", "add", "--", step)
-    after = item.get("after", [])
-    if after and result["outcome"] == "created":
-        run("edit", f"T{n}", *[a for k in after for a in ("--after", f"T{numbers[k]}")])
-    print(f"T{n} {result['outcome']}: {item['title']}")
+    task = f"T{n}"
+    steps = item.get("steps", [])
+    after = [numbers[key] for key in item.get("after", [])]
+    if outcome == "created":
+        for step in steps:
+            run("steps", task, "add", "--", step)
+        if after:
+            run("edit", task, *[arg for dep in after for arg in ("--after", f"T{dep}")])
+    else:
+        current, = json.loads(run("list", task, "--json"))
+        missing_steps = set(steps) - {step["text"] for step in current["steps"]}
+        missing_after = set(after) - {dep["task"] for dep in current["after"]}
+        if missing_steps or missing_after:
+            gaps = [f"step {step!r}" for step in sorted(missing_steps)]
+            gaps.extend(f"prerequisite T{dep}" for dep in sorted(missing_after))
+            sys.exit(f"{task} is missing {', '.join(gaps)}. Update it on the board, then rerun.")
+    print(f"{task} {outcome}: {item['title']}")

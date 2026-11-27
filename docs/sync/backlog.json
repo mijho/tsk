@@ -59,7 +59,7 @@
    "steps": ["inverse per op", "ctrl+u on a shared board", "docs"]},
   {"key": "dispatch-host", "thread": "sync-p2", "after": ["outbox"], "title": "Host-tagged dispatch records",
    "steps": ["tag on write", "ignored on other hosts", "docs"]},
-  {"key": "dogfood", "thread": "sync-p2", "after": ["provisional", "rejects", "release", "deploy"], "title": "Move this board onto the shared workspace",
+  {"key": "dogfood", "thread": "sync-p2", "after": ["provisional", "rejects", "release", "undo", "dispatch-host", "deploy"], "title": "Move this board onto the shared workspace",
    "notes": "Ask the maintainer first: block on you with the cut-over plan."},
 
   {"key": "events", "thread": "sync-p3", "after": ["srv-read"], "title": "GET /events SSE stream",
