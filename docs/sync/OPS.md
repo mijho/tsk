@@ -9,6 +9,21 @@ Each op records intent, not a proposed task or store. This is the phase-0 invent
 - A patch distinguishes omitted, set, and cleared fields. An append to notes appends to the current notes; do not turn it into a stale replacement. Compare status with `from` and flag mismatches; keep overwritten scalar values in the paper trail.
 - `Batch(ordered intents)` preserves the marked board verb's prevalidation, atomicity, and one undo entry. A dispatching start batch is the exception: each successful external launch lands individually. A transaction with no undo today does not gain local undo in phase 0.
 
+### Local apply boundary
+
+`DomainState::apply` is the local replay seam, not the public wire protocol.
+Its typed marked verbs call the existing batch mutations. `Transaction` is
+an atomic save of ordered intents and does not combine separate undo entries.
+The caller owns persistence, op deduplication, release planning, and host I/O.
+
+Task and step creation carry explicit IDs. Until store migrations and authority
+wiring, local project scopes are paths and `after` IDs resolve to stored numbers.
+Round, reply, and check selectors use guarded legacy identities without storing
+new fields. Ambiguous child selectors refuse rather than picking a match.
+Local undo still addresses the current stack top. Purged-task restore still
+requires the store/authority to resolve the tombstone; domain `Restore` can
+only clear soft-delete on a retained task.
+
 ## Tasks and lifecycle
 
 | Op and payload | Current entry points | Conflict and undo boundary |

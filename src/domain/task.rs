@@ -285,7 +285,8 @@ impl AssigneeKind {
 }
 
 /// A resolved assignee: the stored name and what it stands for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Assignee {
     pub name: String,
     pub kind: AssigneeKind,
@@ -1164,13 +1165,24 @@ impl DomainState {
         provenance: ProvenanceOrigin,
         thread: Option<String>,
     ) -> Result<Uuid, DomainError> {
+        self.create_with_id(mutation_id(), title, notes, scope, provenance, thread)
+    }
+
+    pub(super) fn create_with_id(
+        &mut self,
+        id: Uuid,
+        title: impl AsRef<str>,
+        notes: Option<String>,
+        scope: TaskScope,
+        provenance: ProvenanceOrigin,
+        thread: Option<String>,
+    ) -> Result<Uuid, DomainError> {
         let title = title.as_ref().trim();
         if title.is_empty() {
             return Err(DomainError::EmptyTitle);
         }
 
         let now = mutation_time();
-        let id = mutation_id();
         self.tasks.push(Task {
             id,
             number: None,
@@ -1227,11 +1239,21 @@ impl DomainState {
         base: Option<String>,
     ) -> Result<Uuid, DomainError> {
         let id = self.create(title, notes, scope, provenance, thread)?;
+        self.configure_created(id, assignee, base)?;
+        Ok(id)
+    }
+
+    pub(super) fn configure_created(
+        &mut self,
+        id: Uuid,
+        assignee: Option<Assignee>,
+        base: Option<String>,
+    ) -> Result<(), DomainError> {
         self.show_assigned(assignee.as_ref());
         let task = self.task_mut(id)?;
         task.set_assigned(assignee);
         task.base = base;
-        Ok(id)
+        Ok(())
     }
 
     /// Seeder-only create for a human notice row. Marks the task as a notice with the
@@ -2445,12 +2467,43 @@ impl DomainState {
         step_adds: &[String],
         step_adds_after: Option<Uuid>,
     ) -> Result<(), DomainError> {
+        let additions: Vec<_> = step_adds.iter().map(|text| (None, text.as_str())).collect();
+        self.edit_with_identified_steps(
+            id,
+            title,
+            notes,
+            scope,
+            thread,
+            assignee,
+            base,
+            step_renames,
+            step_removals,
+            &additions,
+            step_adds_after,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn edit_with_identified_steps(
+        &mut self,
+        id: Uuid,
+        title: impl AsRef<str>,
+        notes: Option<String>,
+        scope: TaskScope,
+        thread: Option<String>,
+        assignee: Option<Assignee>,
+        base: Option<String>,
+        step_renames: &[(Uuid, String)],
+        step_removals: &[Uuid],
+        step_adds: &[(Option<Uuid>, &str)],
+        step_adds_after: Option<Uuid>,
+    ) -> Result<(), DomainError> {
         let title = title.as_ref().trim();
         if title.is_empty() {
             return Err(DomainError::EmptyTitle);
         }
         if step_renames.iter().any(|(_, text)| text.trim().is_empty())
-            || step_adds.iter().any(|text| text.trim().is_empty())
+            || step_adds.iter().any(|(_, text)| text.trim().is_empty())
         {
             return Err(DomainError::EmptyStepText);
         }
@@ -2500,8 +2553,8 @@ impl DomainState {
         }
         let added: Vec<Step> = step_adds
             .iter()
-            .map(|text| Step {
-                id: mutation_id(),
+            .map(|(id, text)| Step {
+                id: id.unwrap_or_else(mutation_id),
                 text: text.trim().to_string(),
                 done: false,
             })
@@ -2567,17 +2620,27 @@ impl DomainState {
         text: impl AsRef<str>,
         index: usize,
     ) -> Result<Uuid, DomainError> {
+        self.insert_step_with_id(task_id, mutation_id(), text, index)
+    }
+
+    pub(super) fn insert_step_with_id(
+        &mut self,
+        task_id: Uuid,
+        step_id: Uuid,
+        text: impl AsRef<str>,
+        index: usize,
+    ) -> Result<Uuid, DomainError> {
         let text = text.as_ref().trim();
         if text.is_empty() {
             return Err(DomainError::EmptyStepText);
         }
         let task = self.task_mut(task_id)?;
         let step = Step {
-            id: mutation_id(),
+            id: step_id,
             text: text.to_string(),
             done: false,
         };
-        let step_id = step.id;
+
         let index = index.min(task.steps.len());
         task.steps.insert(index, step);
         record_mutation(task, TaskEventKind::StepAdded);

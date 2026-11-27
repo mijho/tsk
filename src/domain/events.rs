@@ -165,7 +165,7 @@ struct MutationInputs {
 /// Run a synchronous domain mutation with repeatable time, actor and generated IDs.
 /// Use a distinct seed per replayed operation; outside the scope local mutations use
 /// the wall clock and random IDs as usual.
-pub fn with_mutation_inputs<T>(
+pub(super) fn with_mutation_inputs<T>(
     at: SystemTime,
     seed: Uuid,
     actor: &str,

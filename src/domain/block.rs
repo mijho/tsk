@@ -412,14 +412,16 @@ impl Block {
 }
 
 /// The identity of one block, for sessions that must stay bound to the block they opened on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockKey {
     pub by: String,
     pub at: SystemTime,
 }
 
 /// Validated content for a new block.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockDraft {
     pub why: Option<String>,
     pub needs: Option<String>,
@@ -497,7 +499,8 @@ impl BlockDraft {
 }
 
 /// Validated content for a review round.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewDraft {
     pub done: Option<String>,
     pub checks: Vec<Check>,
