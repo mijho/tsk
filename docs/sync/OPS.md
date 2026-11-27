@@ -25,11 +25,12 @@ Each op records intent, not a proposed task or store. This is the phase-0 invent
 CLI JSON-plan add is partial success, not an atomic `Batch`: refused items and existing
 matches emit no op. Record successful creates in input order under the existing single save.
 
-A user start carries an explicit prerequisite policy in its `SetStatus` intent
-or dispatching-start intent: check prerequisites unless the user chose CLI
-`--force` or confirmed board **Start anyway**. Check ordinary starts against
-current prerequisites at apply time; never infer the override from the target
-status. Release starts have their own completion-driven path.
+Ordinary CLI `status started` and the board Start verb check current
+prerequisites on apply, including when they dispatch. Record CLI `--force`
+or board **Start anyway** as an explicit override; do not infer it from the
+target status. Reply-box unblock and send-back, direct CLI dispatch and
+relaunch, and board `DispatchAgain` carry their own intent and do not use
+the ordinary start gate. Release starts have a completion-driven path.
 
 ## Rounds and steps
 
