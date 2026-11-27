@@ -72,9 +72,9 @@
 
   {"key": "claim", "thread": "sync-p4", "after": ["conflicts"], "title": "tsk claim: server compare-and-set",
    "steps": ["claim op", "refused second claim", "offline writes under a claim", "docs + skill"]},
-  {"key": "stale-claim", "thread": "sync-p4", "after": ["claim"], "title": "Flag stale claims, never auto-release",
+  {"key": "stale-claim", "thread": "sync-p4", "after": ["claim", "pwa-read"], "title": "Flag stale claims, never auto-release",
    "steps": ["staleness rule", "flag on board and PWA"]},
 
-  {"key": "pwa-write", "thread": "sync-p5", "after": ["pwa-read", "claim"], "title": "PWA writes: status, reply, quick-add",
+  {"key": "pwa-write", "thread": "sync-p5", "after": ["stale-claim"], "title": "PWA writes: status, reply, quick-add",
    "steps": ["status verbs", "reply to a block", "quick-add", "write-scope token"]}
 ]
