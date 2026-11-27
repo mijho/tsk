@@ -32,7 +32,7 @@ matches emit no op. Record successful creates in input order under the existing 
 | `OpenBlock(task, from, record, why, needs, options, on)`, `OpenReview(task, from, record, done, checks, next, on)` | CLI status; board block/review cards; `block`, `review`, `block_batch`, `review_batch` | Status conflict check plus distinct round identity; do not replace a newer round silently. Board opens add one batch undo even for one target. CLI opens and in-place edits add none. |
 | `EditBlock`, `EditReview`, `SetOn` (task, record, patch) | CLI status and edit; board round cards and selector; `edit_block`, `edit_review`, `set_on`, `set_on_batch` | Patch only the addressed open record. Preserve retained check state when editing the list. Single and marked `SetOn` have undo. CLI `edit --on` also adds that entry, which a later due change in the same edit can stale. |
 | `SetCheck(task, record, check, state)` | CLI checks; board review checklist | Address the check in its original round. No undo today; carry explicit state rather than a toggle. |
-| `AddReply(task, record, reply, text)`, `EditReply`, `DeleteReply` (same IDs, optional text), `MarkReplySent(task, record, reply, sent version)` | CLI reply; board reply editor; `reply`, `edit_reply`, `delete_reply`, `mark_reply_sent` | Union inserts by ID; edits and tombstones target one reply. Delivery marks only the still-current round and text. Reply-only saves add no undo. |
+| `AddReply(task, record, reply, text)`, `EditReply`, `DeleteReply` (same IDs, optional text), `MarkReplySent(task, record, reply, sent version)` | CLI reply; board reply editor; `reply`, `edit_reply`, `delete_reply`, `mark_reply_sent` | Union inserts by ID; edits and tombstones target one reply. Changed text clears `sent`. Delivery marks only the still-current round and text. Reply-only saves add no undo. |
 | `InsertStep(task, step, text, anchor)`, `MoveStep(task, step, anchor)`, `ToggleStep(task, step)`, `RenameStep(task, step, text)`, `RemoveStep(task, step)` | CLI steps; board task page and form; `insert_step`, `move_step`, `toggle_step`, `rename_step`, `remove_step` | Union new IDs. Order, edits, and removals target the addressed step. Apply toggle once per op ID; concurrent moves are ordered by the authority. Board `with_steps_undo` or form undo owns the boundary; CLI step verbs add none. |
 
 Reply-box unblock, send-back, and approval address the exact open round, even
@@ -43,11 +43,20 @@ requires a failed check, and a review send-back always targets `started`.
   `SetStatus` closes the round, in one `as_one_change` transaction. Only status is
   undoable; the reply survives the inverse.
 - **Unblock or send-back with dispatch or relaunch:** Save any feedback first,
-  keeping the round open. On successful launch, record dispatch and `started`
-  in a separate save. Refusal or cancellation does not roll back feedback.
+  keeping the round open. An ordinary block on this route refuses a blank reply
+  before launch or confirmation; a review with a failed check can send back
+  without feedback. On successful launch, record dispatch and `started` in a
+  separate save. Refusal or cancellation does not roll back feedback.
+  Declining relaunch with `n`, or retrying a failed feedback save that now
+  routes to a plain start, saves an undoable status change separately. Neither
+  replaces the dispatch record.
 - **Approval:** Save any feedback before entering the normal completion or
   cleanup route. Cancelling the cleanup card leaves the review open and the
   feedback saved.
+
+CLI `reply --send` saves the reply before delivery. After a successful send,
+`MarkReplySent` records the guarded result separately. The marker adds no event
+or undo entry, but retargets existing undo entries that match the old revision.
 
 ## Project, dispatch, and maintenance
 
