@@ -20,6 +20,8 @@ pub mod scope;
 pub mod setup;
 pub mod setup_agent;
 pub mod store;
+#[cfg(feature = "sync-server")]
+pub mod sync;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/stub.rs"]
 pub(crate) mod test_stub;

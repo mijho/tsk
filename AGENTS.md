@@ -75,6 +75,7 @@ same PR, never leave them apart.
 | `src/board_pane.rs` | `--find-board-pane` lookup for the launchers |
 | `src/guides.rs`, `src/announcements.rs`, `src/delivery.rs` | seeded notice tasks |
 | `src/update.rs` | release check, `tsk update` |
+| `src/sync/`, `src/bin/tsk-sync.rs` | the shared-workspace server behind the `sync-server` feature: config, SQLite schema and migrations, HTTP |
 | `scripts/open-board.sh`, `scripts/open-capture.sh`, `scripts/*.ps1` | Herdr launchers (embedded via `src/setup.rs`) |
 | `scripts/release.py`, `.github/workflows/release.yml`, `packaging/` | native packaging |
 | `site/` | landing page + Starlight docs (Astro), shell and PowerShell installers, `llms.txt`, `board-demo.js` |
@@ -87,6 +88,7 @@ same PR, never leave them apart.
 | Build | `cargo build --release` |
 | Test | `cargo test` (plain, parallel; 1000+ tests, well under a minute warm) |
 | Green bar | `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` |
+| Sync server | `cargo clippy --features sync-server --all-targets -- -D warnings && cargo test --features sync-server --lib sync::` (with any `src/sync/` change) |
 | One integration suite | `cargo test --test integration <module>::` |
 | Targeted run | `cargo test --lib` or `cargo test --test <name>` |
 | Regenerate golden fixtures | `cargo test --test integration queue_board_render::regenerate_golden_fixtures -- --ignored` |

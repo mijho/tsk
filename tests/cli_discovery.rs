@@ -112,3 +112,52 @@ fn integration_suites_are_registered_once_with_bounded_binary_count() {
         "register every suite in integration.rs or Cargo.toml"
     );
 }
+
+/// The default `tsk` build pulls no server deps: they are optional, only the `sync-server`
+/// feature enables them, and the `tsk-sync` binary requires it.
+#[test]
+fn the_sync_server_deps_stay_behind_their_feature() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest: toml_edit::DocumentMut = std::fs::read_to_string(root.join("Cargo.toml"))
+        .expect("Cargo.toml")
+        .parse()
+        .expect("toml");
+    let server_deps = ["rusqlite", "tiny_http"];
+    for dep in server_deps {
+        let spec = &manifest["dependencies"][dep];
+        assert_eq!(
+            spec["optional"].as_bool(),
+            Some(true),
+            "{dep} must be optional"
+        );
+    }
+    let features = manifest["features"].as_table().expect("[features]");
+    for (name, enables) in features.iter() {
+        let enables: Vec<&str> = enables
+            .as_array()
+            .expect("feature list")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect();
+        for dep in server_deps {
+            let enabled = enables.contains(&format!("dep:{dep}").as_str());
+            assert_eq!(enabled, name == "sync-server", "{dep} in feature {name}");
+        }
+    }
+    assert!(
+        manifest["features"].get("default").is_none(),
+        "no default features"
+    );
+    let bins = manifest["bin"].as_array_of_tables().expect("[[bin]]");
+    let sync = bins
+        .iter()
+        .find(|bin| bin["name"].as_str() == Some("tsk-sync"))
+        .expect("tsk-sync bin");
+    let required: Vec<&str> = sync["required-features"]
+        .as_array()
+        .expect("required-features")
+        .iter()
+        .filter_map(|item| item.as_str())
+        .collect();
+    assert_eq!(required, ["sync-server"]);
+}

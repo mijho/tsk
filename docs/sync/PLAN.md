@@ -64,7 +64,9 @@ claim is refused. A stale claim is flagged, never auto-released (human status is
 ## Server
 
 - Binary `tsk-sync`, same crate, behind cargo feature `sync-server`, so the default `tsk`
-  build and CI matrix pull no server deps. Client HTTP uses `ureq` (blocking).
+  build and CI matrix pull no server deps. Client HTTP uses `ureq` (blocking); the server
+  uses `tiny_http` (blocking, no async runtime). Config is `[server] listen, database`,
+  every key required and known; the schema version is SQLite's `user_version`.
 - SQLite (`rusqlite`, bundled). Tables: `ops(seq, op_id UNIQUE, actor, at, task_id, body)`,
   `tasks` (projection), `counters`, `tokens(actor, hash, scope)`, `meta(protocol_version)`.
 - Endpoints: `POST /ops`, `GET /snapshot`, `GET /ops?after=N`, `GET /events` (SSE),

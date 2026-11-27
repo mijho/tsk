@@ -63,6 +63,12 @@ jobs:
         if: steps.changes.outputs.rust == 'true'
         run: cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && cargo build --release
 
+      # The shared-workspace server builds only with its feature; the default build above
+      # pulls none of its deps.
+      - name: Sync server
+        if: steps.changes.outputs.rust == 'true' && matrix.os == 'ubuntu-latest'
+        run: cargo clippy --features sync-server --all-targets -- -D warnings && cargo test --features sync-server --lib sync::
+
       - name: Packaging contract tests
         if: steps.changes.outputs.rust == 'true' && runner.os != 'Windows'
         env:
