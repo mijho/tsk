@@ -6,8 +6,9 @@ use crate::agents::AgentProfiles;
 use crate::cli::parser::{BlockFlags, TaskAddress};
 use crate::dispatch::{self, DispatchError, DispatchHost, DispatchResult, HostKind, StartRoute};
 use crate::domain::{
-    actor_from_env, BlockDraft, BlockField, BlockKind, BlockOn, BlockPatch, DomainError,
-    DomainState, HumanStatus, ReviewDraft, ReviewPatch, OWNER,
+    actor_from_env, ApplyError, BlockDraft, BlockField, BlockIntentPatch, BlockKey, BlockKind,
+    BlockOn, DomainError, DomainState, HumanStatus, Intent, OpenRoundMode, OpenRoundTarget,
+    PrerequisitePolicy, ReviewDraft, ReviewIntentPatch, RoundIntent, TextPatch, OWNER,
 };
 use crate::store::{default_state_dir, TaskStore};
 use uuid::Uuid;
@@ -65,7 +66,12 @@ pub fn run(
     block: BlockFlags,
     state_dir: Option<PathBuf>,
 ) -> Result<StatusResult, StatusError> {
-    run_as(target, status, block, state_dir, &actor_from_env())
+    let policy = if status == HumanStatus::Started {
+        PrerequisitePolicy::Check
+    } else {
+        PrerequisitePolicy::NotApplicable
+    };
+    run_as(target, status, block, state_dir, &actor_from_env(), policy)
 }
 
 /// [`run`] by `actor`.
@@ -75,6 +81,7 @@ fn run_as(
     block: BlockFlags,
     state_dir: Option<PathBuf>,
     actor: &str,
+    policy: PrerequisitePolicy,
 ) -> Result<StatusResult, StatusError> {
     let state_dir = state_dir.unwrap_or_else(default_state_dir);
     // `--on` by the name rule: a block or review handed to an agent names its profile. A
@@ -97,9 +104,17 @@ fn run_as(
                     title: task.title.clone(),
                     current: task.status,
                     soft_deleted: task.soft_deleted,
-                    open: task.block.as_ref().map(|block| block.kind),
+                    open: task.block.as_ref().map(|block| (block.kind, block.key())),
                 });
-            Ok(apply(state, found, status, &block, on.clone(), actor))
+            Ok(apply(
+                state,
+                found,
+                status,
+                &block,
+                on.clone(),
+                actor,
+                policy,
+            ))
         })
         .map_err(StatusError::Store)?
 }
@@ -162,7 +177,7 @@ pub fn run_done_with_host(
                     title: task.title.clone(),
                     current: task.status,
                     soft_deleted: task.soft_deleted,
-                    open: task.block.as_ref().map(|block| block.kind),
+                    open: task.block.as_ref().map(|block| (block.kind, block.key())),
                 });
             let _ = state.take_completed();
             let (result, changed) = apply(
@@ -172,6 +187,7 @@ pub fn run_done_with_host(
                 &BlockFlags::default(),
                 None,
                 actor,
+                PrerequisitePolicy::NotApplicable,
             );
             let released = if changed {
                 dispatch::plan_released_with_host(state, actor, host_kind, None, host)
@@ -312,6 +328,11 @@ pub fn run_started_with_host(
             }
         }
     }
+    let policy = if flags.force {
+        PrerequisitePolicy::Override
+    } else {
+        PrerequisitePolicy::Check
+    };
     let plain = |state_dir| {
         run_as(
             target,
@@ -319,6 +340,7 @@ pub fn run_started_with_host(
             BlockFlags::default(),
             state_dir,
             actor,
+            policy,
         )
         .map(StartOutcome::Status)
     };
@@ -416,6 +438,7 @@ pub fn run_ready_with_host(
         BlockFlags::default(),
         state_dir,
         actor,
+        PrerequisitePolicy::NotApplicable,
     )?;
     let line = closing.and_then(|closing| closing.deliver(&store, target, host_kind, host));
     Ok((result, line))
@@ -478,7 +501,8 @@ struct Found {
     title: String,
     current: HumanStatus,
     soft_deleted: bool,
-    open: Option<BlockKind>,
+    /// The open block or review round.
+    open: Option<(BlockKind, BlockKey)>,
 }
 
 fn apply(
@@ -488,6 +512,7 @@ fn apply(
     flags: &BlockFlags,
     on: Option<BlockOn>,
     actor: &str,
+    policy: PrerequisitePolicy,
 ) -> (Result<StatusResult, StatusError>, bool) {
     let Some(found) = found else {
         return (Err(StatusError::UnknownTask), false);
@@ -503,15 +528,32 @@ fn apply(
         title: found.title,
         status,
     };
-    let outcome = if status == HumanStatus::Blocked && !flags.is_empty() {
+    let open_kind = found.open.as_ref().map(|(kind, _)| *kind);
+    let open_record = found.open.as_ref().map(|(_, key)| key.clone());
+    let target = OpenRoundTarget {
+        task: found.id,
+        from: found.current,
+        expected_record: open_record.clone(),
+    };
+    let round = |change| Intent::Round {
+        change: Box::new(change),
+    };
+    let intent = if status == HumanStatus::Blocked && !flags.is_empty() {
         let draft = match block_draft(state, flags, on, number) {
             Ok(draft) => draft,
             Err(error) => return (Err(error), false),
         };
-        if found.open == Some(BlockKind::Blocked) {
-            state.edit_block(found.id, patch_from(flags, draft))
-        } else {
-            state.block(found.id, draft, actor).map(|()| true)
+        match open_record.filter(|_| open_kind == Some(BlockKind::Blocked)) {
+            Some(record) => round(RoundIntent::EditBlock {
+                task: found.id,
+                record,
+                patch: patch_from(flags, draft),
+            }),
+            None => round(RoundIntent::OpenBlock {
+                targets: vec![target],
+                mode: OpenRoundMode::Cli,
+                draft,
+            }),
         }
     } else if status == HumanStatus::Review && !flags.is_empty() {
         let draft = match ReviewDraft::from_input(
@@ -523,20 +565,51 @@ fn apply(
             Ok(draft) => draft,
             Err(field) => return (Err(StatusError::TextTooLong(field)), false),
         };
-        if found.open == Some(BlockKind::Review) {
-            state.edit_review(found.id, review_patch_from(flags, draft))
-        } else {
-            state.review(found.id, draft, actor).map(|()| true)
+        match open_record.filter(|_| open_kind == Some(BlockKind::Review)) {
+            Some(record) => round(RoundIntent::EditReview {
+                task: found.id,
+                record,
+                patch: review_patch_from(flags, draft),
+            }),
+            None => round(RoundIntent::OpenReview {
+                targets: vec![target],
+                mode: OpenRoundMode::Cli,
+                draft,
+            }),
         }
     } else if found.current == status {
-        Ok(false)
+        return (Ok(result), false);
     } else {
-        state.set_status_by(found.id, status, actor).map(|()| true)
+        Intent::SetStatus {
+            task: found.id,
+            from: found.current,
+            to: status,
+            prerequisite_policy: policy,
+            undo: false,
+        }
     };
-    match outcome {
-        Ok(changed) => (Ok(result), changed),
-        Err(DomainError::UnknownId(_)) => (Err(StatusError::UnknownTask), false),
+    match state.apply_local(actor, intent) {
+        Ok(outcome) => (Ok(result), outcome.changed),
+        Err(ApplyError::Domain(DomainError::UnknownId(_))) => {
+            (Err(StatusError::UnknownTask), false)
+        }
+        Err(ApplyError::WaitingOn { task, .. }) => {
+            let waiting = state
+                .get(task)
+                .and_then(|task| state.waiting_text(task))
+                .unwrap_or_default();
+            (Err(StatusError::AfterNotDone(waiting)), false)
+        }
         Err(other) => (Err(StatusError::Store(other.to_string())), false),
+    }
+}
+
+/// A given flag sets its field; a flag whose text trims away clears it.
+fn text_patch(given: bool, value: Option<String>) -> TextPatch {
+    match (given, value) {
+        (false, _) => TextPatch::Keep,
+        (true, Some(value)) => TextPatch::Set(value),
+        (true, None) => TextPatch::Clear,
     }
 }
 
@@ -567,21 +640,22 @@ fn block_draft(
 }
 
 /// Re-blocking replaces only the fields that were given.
-fn patch_from(flags: &BlockFlags, draft: BlockDraft) -> BlockPatch {
-    BlockPatch {
-        why: flags.why.is_some().then_some(draft.why),
-        needs: flags.needs.is_some().then_some(draft.needs),
+fn patch_from(flags: &BlockFlags, draft: BlockDraft) -> BlockIntentPatch {
+    BlockIntentPatch {
+        why: text_patch(flags.why.is_some(), draft.why),
+        needs: text_patch(flags.needs.is_some(), draft.needs),
         options: (!flags.options.is_empty()).then_some(draft.options),
         on: flags.on.is_some().then_some(draft.on),
     }
 }
 
 /// Re-running review replaces only the fields that were given.
-fn review_patch_from(flags: &BlockFlags, draft: ReviewDraft) -> ReviewPatch {
-    ReviewPatch {
-        done: flags.done.is_some().then_some(draft.done),
-        checks: (!flags.checks.is_empty()).then_some(draft.checks),
-        next: flags.next.is_some().then_some(draft.next),
+fn review_patch_from(flags: &BlockFlags, draft: ReviewDraft) -> ReviewIntentPatch {
+    ReviewIntentPatch {
+        done: text_patch(flags.done.is_some(), draft.done),
+        checks: (!flags.checks.is_empty())
+            .then(|| draft.checks.into_iter().map(|check| check.text).collect()),
+        next: text_patch(flags.next.is_some(), draft.next),
         on: flags.on.is_some().then_some(draft.on),
     }
 }
@@ -1341,5 +1415,57 @@ mod start_tests {
                     .as_str()
             )
         );
+    }
+
+    /// The prerequisite gate holds under the store lock, not only in the read before it, and
+    /// `--force` overrides it there too.
+    #[test]
+    fn the_locked_start_checks_prerequisites_unless_forced() {
+        let mut state = DomainState::new();
+        let scope = TaskScope::Global;
+        let first = state
+            .create("first", None, scope.clone(), ProvenanceOrigin::Manual, None)
+            .expect("first");
+        let second = state
+            .create("second", None, scope, ProvenanceOrigin::Manual, None)
+            .expect("second");
+        state.assign_numbers_for_persistence();
+        state.set_after(second, &[1]).expect("after");
+        let found = |state: &DomainState| {
+            let task = state.get(second).expect("task");
+            Some(Found {
+                id: second,
+                number: task.number,
+                title: task.title.clone(),
+                current: task.status,
+                soft_deleted: false,
+                open: None,
+            })
+        };
+        let start = |state: &mut DomainState, policy| {
+            let found = found(state);
+            let flags = BlockFlags::default();
+            apply(
+                state,
+                found,
+                HumanStatus::Started,
+                &flags,
+                None,
+                OWNER,
+                policy,
+            )
+        };
+        let (refused, changed) = start(&mut state, PrerequisitePolicy::Check);
+        assert_eq!(
+            refused.expect_err("waits").code(),
+            "after-not-done",
+            "T1 is still open"
+        );
+        assert!(!changed);
+        assert_eq!(state.get(second).unwrap().status, HumanStatus::Open);
+        let (forced, changed) = start(&mut state, PrerequisitePolicy::Override);
+        assert!(forced.is_ok() && changed);
+        assert_eq!(state.get(second).unwrap().status, HumanStatus::Started);
+        assert_eq!(state.get(first).unwrap().status, HumanStatus::Open);
     }
 }

@@ -55,6 +55,8 @@ pub enum RoundIntent {
         task: Uuid,
         record: BlockKey,
         check: String,
+        /// Which check with this exact text, counting from 0 in round order.
+        occurrence: usize,
         state: CheckState,
     },
     AddReply {
@@ -305,17 +307,21 @@ impl RoundIntent {
                 task,
                 record,
                 check,
+                occurrence,
                 state,
             } => {
                 let block = require_round(domain, *task, record)?;
                 if !block.is_review() {
                     return Err(DomainError::NotInReview(*task).into());
                 }
-                let index = unique_index(
-                    block.checks.iter().map(|item| item.text == *check),
-                    "ambiguous check text",
-                )?
-                .ok_or(ApplyError::InvalidIntent("unknown check text"))?;
+                let index = block
+                    .checks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.text == *check)
+                    .nth(*occurrence)
+                    .map(|(index, _)| index)
+                    .ok_or(ApplyError::InvalidIntent("unknown check"))?;
                 Ok(domain.set_check(*task, index, *state)?)
             }
             Self::AddReply { task, record, text } => {
@@ -680,6 +686,7 @@ mod tests {
             task,
             record: record.clone(),
             check: "lint".into(),
+            occurrence: 0,
             state: CheckState::Failed,
         };
         assert!(apply(&mut domain, 3, OWNER, &check).unwrap());
@@ -700,17 +707,22 @@ mod tests {
         assert_eq!(block.done, None);
         assert_eq!(block.next.as_deref(), Some("next"));
         assert_eq!(block.checks[1].state, CheckState::Failed);
-        let ambiguous = RoundIntent::SetCheck {
+        let key = block.key();
+        let repeated = |occurrence| RoundIntent::SetCheck {
             task,
-            record: block.key(),
+            record: key.clone(),
             check: "test".into(),
+            occurrence,
             state: CheckState::Passed,
         };
         assert_eq!(
-            apply(&mut domain, 5, OWNER, &ambiguous),
-            Err(ApplyError::InvalidIntent("ambiguous check text"))
+            apply(&mut domain, 5, OWNER, &repeated(2)),
+            Err(ApplyError::InvalidIntent("unknown check"))
         );
-        assert_eq!(round(&domain, task).checks[0].state, CheckState::Open);
+        assert!(apply(&mut domain, 6, OWNER, &repeated(1)).unwrap());
+        let checks = &round(&domain, task).checks;
+        assert_eq!(checks[0].state, CheckState::Open);
+        assert_eq!(checks[2].state, CheckState::Passed);
     }
 
     #[test]

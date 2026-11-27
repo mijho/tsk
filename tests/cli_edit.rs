@@ -755,3 +755,25 @@ fn a_configured_me_name_reads_as_you_and_json_keeps_you() {
     assert_eq!(text.code, 0, "{text:?}");
     assert!(text.stdout.contains("@saeed"), "{}", text.stdout);
 }
+
+#[test]
+fn one_edit_of_several_fields_lands_as_one_change_at_one_time() {
+    let dir = temp_state_dir("one-op");
+    let _guard = TempDirGuard(dir.clone());
+    assert_eq!(add_task(&dir, "old title").code, 0);
+
+    let edited = edit(&dir, &["T1", "--title", "new title", "--due", "2027-01-02"]);
+    assert_eq!(edited.code, 0, "{:?}", edited.stderr);
+    let state = TaskStore::new(&dir).load().expect("load");
+    let task = &state.tasks()[0];
+    assert_eq!(task.due.as_deref(), Some("2027-01-02"));
+    let [.., title, due] = task.history.as_slice() else {
+        panic!("the edit records its fields: {:?}", task.history);
+    };
+    assert_eq!(
+        (title.kind, due.kind),
+        (TaskEventKind::Edited, TaskEventKind::Edited)
+    );
+    assert_eq!(title.at, due.at, "both fields belong to one op");
+    assert_eq!(task.updated_at, title.at);
+}

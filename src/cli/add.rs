@@ -8,7 +8,8 @@ use crate::agents::AgentProfiles;
 use crate::cli::parser::FlagAdd;
 use crate::context::snapshot_from_env;
 use crate::domain::{
-    normalize_thread, thread_refusal_message, Assignee, DomainState, ProvenanceOrigin, TaskScope,
+    current_actor, normalize_thread, thread_refusal_message, Assignee, DomainState, Intent,
+    ProvenanceOrigin, TaskScope,
 };
 use crate::scope::{adopt_stored_identity, resolve_flag_scope, resolve_project_path};
 use crate::store::{default_state_dir, TaskStore};
@@ -223,21 +224,21 @@ pub fn run(input: FlagAdd) -> Result<FlagAddResult, AddError> {
             } else {
                 let project = scope_project(&scope);
                 let project_title = scope_title(domain, &scope);
-                let id = match domain.create_configured(
-                    &title,
+                let id = Uuid::new_v4();
+                let intent = Intent::Create {
+                    task: id,
+                    title: title.clone(),
                     notes,
                     scope,
-                    ProvenanceOrigin::Capture,
+                    provenance: ProvenanceOrigin::Capture,
                     thread,
                     assignee,
                     base,
-                ) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        return Ok((Err(AddError::Store(error.to_string())), false));
-                    }
+                    due,
+                    after: Vec::new(),
+                    steps: Vec::new(),
                 };
-                if let Err(error) = domain.set_due_on_create(id, due) {
+                if let Err(error) = domain.apply_local(&current_actor(), intent) {
                     return Ok((Err(AddError::Store(error.to_string())), false));
                 }
                 domain.assign_numbers_for_persistence();
@@ -347,24 +348,29 @@ pub fn run_plan(
                     });
                     continue;
                 }
-                let id = domain
-                    .create_configured(
-                        &item.title,
-                        item.notes,
-                        item.scope,
-                        ProvenanceOrigin::Capture,
-                        item.thread,
-                        item.assignee,
-                        item.base,
-                    )
-                    .expect("plan item titles and threads are validated before domain creation");
+                let id = Uuid::new_v4();
+                let after = item
+                    .after
+                    .iter()
+                    .filter_map(|number| domain.task_by_number(*number).map(|task| task.id))
+                    .collect();
+                let intent = Intent::Create {
+                    task: id,
+                    title: item.title.clone(),
+                    notes: item.notes,
+                    scope: item.scope,
+                    provenance: ProvenanceOrigin::Capture,
+                    thread: item.thread,
+                    assignee: item.assignee,
+                    base: item.base,
+                    due: item.due,
+                    after,
+                    steps: Vec::new(),
+                };
                 domain
-                    .set_due_on_create(id, item.due)
-                    .expect("plan item due dates are validated before domain creation");
+                    .apply_local(&current_actor(), intent)
+                    .expect("plan items are validated before domain creation");
                 domain.assign_numbers_for_persistence();
-                domain
-                    .set_after_on_create(id, &item.after)
-                    .expect("plan item after links are validated before domain creation");
                 let number = domain
                     .get(id)
                     .and_then(|task| task.number)

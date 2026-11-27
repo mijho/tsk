@@ -8,7 +8,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::agents::{AgentProfiles, MergeMethod, RenderContext};
-use crate::domain::{AgentHost, Dispatch, DomainState, HumanStatus, Task, TaskScope};
+use crate::domain::{
+    current_actor, AgentHost, ApplyError, CleanupMarker, Dispatch, DispatchGuard, DispatchIntent,
+    DispatchStart, DomainState, HumanStatus, Intent, PrerequisitePolicy, ReleasedLaunchOutcome,
+    Task, TaskScope,
+};
 
 mod host;
 pub mod pr;
@@ -2634,9 +2638,15 @@ pub fn clean_with_host(
 ) -> Result<CleanupResult, CleanupError> {
     let plan = cleanup_plan(state, id, CleanupRefs::Fetch)?;
     let result = clean_planned_with_host(&plan, host_kind, host)?;
-    state
-        .record_dispatch_cleaned(id, result.outcome())
-        .map_err(|error| CleanupError::Store(error.to_string()))?;
+    let cleanup = DispatchIntent::RecordCleanup {
+        task: id,
+        cleanup: CleanupMarker {
+            expected_dispatch: Box::new(plan.record),
+            outcome: result.outcome(),
+        },
+        keep_undo: false,
+    };
+    apply_dispatch(state, cleanup).map_err(|error| CleanupError::Store(error.to_string()))?;
     Ok(result)
 }
 
@@ -3384,7 +3394,20 @@ pub fn plan_released_with_host(
             StartRoute::AgentGone { assignee } => (ReleasedStart::AgentGone(assignee), false),
             StartRoute::Plain => (ReleasedStart::Started, false),
         };
-        match state.start_released(id, after) {
+        let prerequisite = state.task_by_number(after).map(|task| task.id);
+        let started = prerequisite
+            .ok_or_else(|| format!("T{after} is not on the board"))
+            .and_then(|prerequisite| {
+                apply_dispatch(
+                    state,
+                    DispatchIntent::ReleaseStart {
+                        task: id,
+                        prerequisite,
+                    },
+                )
+                .map_err(|error| error.to_string())
+            });
+        match started {
             Ok(()) if launch => state.hold_launch(id, after),
             Ok(()) => released.push(Released {
                 number,
@@ -3394,7 +3417,7 @@ pub fn plan_released_with_host(
             Err(error) => released.push(Released {
                 number,
                 after,
-                start: ReleasedStart::Failed(error.to_string()),
+                start: ReleasedStart::Failed(error),
             }),
         }
     }
@@ -3425,21 +3448,40 @@ pub fn launch_released_with_host(
         else {
             continue;
         };
+        let prerequisite = state.task_by_number(after).map(|task| task.id);
+        let resolve = |state: &mut DomainState, outcome| {
+            let prerequisite = prerequisite.ok_or(ApplyError::InvalidIntent(
+                "the released task's prerequisite is gone",
+            ))?;
+            apply_dispatch(
+                state,
+                DispatchIntent::ResolveReleasedLaunch {
+                    task: id,
+                    prerequisite,
+                    expected_revision: started_revision,
+                    outcome,
+                },
+            )
+        };
         let launched = profiles.clone().and_then(|profiles| {
             let eligible = check_with_host(state, id, &profiles, false, host_kind, host)
                 .map_err(|error| error.to_string())?;
             let launched =
                 launch_with_host(&eligible, None, host).map_err(|error| error.to_string())?;
-            commit_launch_with_status(state, eligible, launched, false)
-                .map_err(|error| error.to_string())
+            let record = Box::new(launched.record.clone());
+            if resolve(state, ReleasedLaunchOutcome::Succeeded { record }).is_err() {
+                // The task changed since its release: the launch still lands on it, as a
+                // dispatch that is no longer attributed to the release.
+                record_launch(state, &eligible, &launched, None)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(launch_result(eligible, launched))
         });
         let start = match launched {
-            Ok(result) => {
-                let _ = state.note_released_dispatch(id, after, started_revision);
-                ReleasedStart::Dispatched(Box::new(result))
-            }
+            Ok(result) => ReleasedStart::Dispatched(Box::new(result)),
             Err(reason) => {
-                let _ = state.return_released_to_ready(id, started_revision);
+                // A task that changed since its release keeps that change.
+                let _ = resolve(state, ReleasedLaunchOutcome::Failed);
                 ReleasedStart::BackToReady(reason)
             }
         };
@@ -4747,15 +4789,62 @@ pub(crate) mod thread_probe {
 }
 
 /// Record a launch on its task: the dispatch record and `started`, in one domain change.
+/// The check and the launch ran on this same `state`, so the record replaces exactly the
+/// dispatch the check saw.
 pub fn commit_launch(
     state: &mut DomainState,
     eligible: EligibleDispatch,
     launched: Launched,
 ) -> Result<DispatchResult, DispatchError> {
-    commit_launch_with_status(state, eligible, launched, true)
+    let from = state
+        .get(eligible.id)
+        .ok_or(DispatchError::UnknownTask)?
+        .status;
+    let start = DispatchStart {
+        from,
+        prerequisite_policy: PrerequisitePolicy::NotApplicable,
+        undo: false,
+    };
+    record_launch(state, &eligible, &launched, Some(start))
+        .map_err(|error| DispatchError::Store(error.to_string()))?;
+    Ok(launch_result(eligible, launched))
 }
 
-/// [`commit_launch`], starting the task only when `start` is set.
+/// Record a launch as a dispatch op, guarded by the dispatch its check saw.
+fn record_launch(
+    state: &mut DomainState,
+    eligible: &EligibleDispatch,
+    launched: &Launched,
+    start: Option<DispatchStart>,
+) -> Result<(), ApplyError> {
+    apply_dispatch(
+        state,
+        DispatchIntent::RecordDispatch {
+            task: eligible.id,
+            expected: DispatchGuard::Dispatch {
+                expected: eligible.task.dispatch.clone().map(Box::new),
+            },
+            record: Box::new(launched.record.clone()),
+            start,
+        },
+    )
+}
+
+/// Apply a dispatch intent as a local op by this thread's actor.
+fn apply_dispatch(state: &mut DomainState, change: DispatchIntent) -> Result<(), ApplyError> {
+    state
+        .apply_local(
+            &current_actor(),
+            Intent::Dispatch {
+                change: Box::new(change),
+            },
+        )
+        .map(|_| ())
+}
+
+/// [`commit_launch`] for the board's marked-set dispatch, starting the task only when `start`
+/// is set. It records on a task deleted while its agent launched, which the dispatch op
+/// refuses, so it stays a direct mutation until the board routes through ops.
 pub fn commit_launch_with_status(
     state: &mut DomainState,
     eligible: EligibleDispatch,
@@ -4765,7 +4854,11 @@ pub fn commit_launch_with_status(
     state
         .record_dispatch_with_status(eligible.id, launched.record.clone(), start)
         .map_err(|error| DispatchError::Store(error.to_string()))?;
-    Ok(DispatchResult {
+    Ok(launch_result(eligible, launched))
+}
+
+fn launch_result(eligible: EligibleDispatch, launched: Launched) -> DispatchResult {
+    DispatchResult {
         warning: launched.warning,
         number: eligible.number,
         title: eligible.task.title,
@@ -4773,7 +4866,7 @@ pub fn commit_launch_with_status(
         assignee: eligible.assignee,
         record: launched.record,
         undo: launched.undo,
-    })
+    }
 }
 
 /// Refuse dispatch where the launch cannot run: on Windows the launcher needs the stock

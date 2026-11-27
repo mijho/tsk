@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::cli::parser::TaskAddress;
-use crate::domain::{CheckState, DomainError, DomainState};
+use crate::domain::{
+    current_actor, ApplyError, CheckState, DomainError, DomainState, Intent, RoundIntent,
+};
 use crate::store::{default_state_dir, TaskStore};
 
 /// The `checks` action parsed from argv.
@@ -81,12 +83,40 @@ fn apply(
     }
     // The parser refuses 0, so `position - 1` is the check's index.
     let index = position - 1;
+    let round = task
+        .block
+        .as_ref()
+        .filter(|block| block.is_review())
+        .ok_or(ChecksError::NotInReview)?;
+    let text = &round
+        .checks
+        .get(index)
+        .ok_or(ChecksError::UnknownCheck)?
+        .text;
+    // Address the check by its round and text, the nth of that text, not by position.
+    let occurrence = round.checks[..index]
+        .iter()
+        .filter(|check| check.text == *text)
+        .count();
+    let change = RoundIntent::SetCheck {
+        task: task_id,
+        record: round.key(),
+        check: text.clone(),
+        occurrence,
+        state,
+    };
     let changed = domain
-        .set_check(task_id, index, state)
+        .apply_local(
+            &current_actor(),
+            Intent::Round {
+                change: Box::new(change),
+            },
+        )
+        .map(|outcome| outcome.changed)
         .map_err(|error| match error {
-            DomainError::NotInReview(_) => ChecksError::NotInReview,
-            DomainError::UnknownCheck(_) => ChecksError::UnknownCheck,
-            DomainError::UnknownId(_) => ChecksError::UnknownTask,
+            ApplyError::Domain(DomainError::NotInReview(_)) => ChecksError::NotInReview,
+            ApplyError::Domain(DomainError::UnknownCheck(_)) => ChecksError::UnknownCheck,
+            ApplyError::Domain(DomainError::UnknownId(_)) => ChecksError::UnknownTask,
             other => ChecksError::Store(other.to_string()),
         })?;
     let text = domain

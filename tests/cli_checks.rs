@@ -273,3 +273,22 @@ fn an_unreadable_store_exits_3() {
         b"{ not json"
     );
 }
+
+#[test]
+fn set_addresses_a_repeated_check_text_by_its_position() {
+    use CheckState::{Open, Passed};
+    let dir = temp_state_dir("repeated");
+    let mut state = DomainState::new();
+    let checks_text = ["same".to_string(), "other".into(), "same".into()];
+    let draft =
+        ReviewDraft::from_input(Some("built it"), &checks_text, None, BlockOn::You).expect("draft");
+    let id = create(&mut state, "in review");
+    state.review(id, draft, "builder").expect("review");
+    TaskStore::new(&dir).save(&state).expect("seed store");
+
+    let output = checks(&dir, &["T1", "set", "3", "passed"]);
+    assert_eq!(output.code, 0, "{output:?}");
+    assert_eq!(output.stdout, "check 3 passed: same\n");
+    assert_eq!(states(&dir, 1), [Open, Open, Passed]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

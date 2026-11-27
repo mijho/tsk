@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::cli::parser::TaskAddress;
-use crate::domain::{DomainError, DomainState};
+use crate::domain::{current_actor, ApplyError, DomainError, DomainState, Intent};
 use crate::store::{default_state_dir, TaskStore};
 
 /// A successful archive/unarchive.
@@ -78,11 +78,13 @@ pub fn run_project(
                     ))
                 }
             };
-            let result = if archive {
-                domain.archive_project(&resolved)
-            } else {
-                domain.unarchive_project(&resolved)
-            };
+            let result = apply(
+                domain,
+                Intent::SetProjectArchived {
+                    project: resolved.clone(),
+                    archived: archive,
+                },
+            );
             match result {
                 Ok(changed) => {
                     let name = domain.project_name(&resolved);
@@ -160,8 +162,13 @@ pub fn run_project_title(
                     ))
                 }
             };
-            let outcome = match domain.set_project_title(&resolved, title.as_deref().unwrap_or(""))
-            {
+            let outcome = match apply(
+                domain,
+                Intent::SetProjectTitle {
+                    project: resolved.clone(),
+                    title: title.clone(),
+                },
+            ) {
                 Ok(changed) => (
                     Ok(ProjectTitleResult {
                         title: domain.project_title(&resolved).map(str::to_string),
@@ -169,13 +176,13 @@ pub fn run_project_title(
                     }),
                     changed,
                 ),
-                Err(DomainError::UnknownProject(_)) => (
+                Err(ApplyError::Domain(DomainError::UnknownProject(_))) => (
                     Err(ProjectTitleError::UnknownProject(format!(
                         "no project named {name} has tasks"
                     ))),
                     false,
                 ),
-                Err(error @ DomainError::ProjectTitleTaken { .. }) => {
+                Err(ApplyError::Domain(error @ DomainError::ProjectTitleTaken { .. })) => {
                     (Err(ProjectTitleError::TitleTaken(error.to_string())), false)
                 }
                 Err(error) => (
@@ -231,11 +238,13 @@ pub fn run_task(
                                 false,
                             ));
                         };
-                        let result = if archive {
-                            state.archive_task(id)
-                        } else {
-                            state.unarchive_task(id)
-                        };
+                        let result = apply(
+                            state,
+                            Intent::SetArchived {
+                                task: id,
+                                archived: archive,
+                            },
+                        );
                         match result {
                             Ok(changed) => (
                                 Ok(ArchiveResult {
@@ -245,7 +254,7 @@ pub fn run_task(
                                 }),
                                 changed,
                             ),
-                            Err(DomainError::SoftDeleted(_)) => (
+                            Err(ApplyError::Domain(DomainError::SoftDeleted(_))) => (
                                 Err(ArchiveCliError::SoftDeleted(format!(
                                     "{display} is deleted"
                                 ))),
@@ -264,4 +273,11 @@ pub fn run_task(
             Ok((outcome, changed))
         })
         .map_err(ArchiveCliError::Store)?
+}
+
+/// Apply one archive or project intent as a local op; returns whether it changed anything.
+fn apply(state: &mut DomainState, intent: Intent) -> Result<bool, ApplyError> {
+    state
+        .apply_local(&current_actor(), intent)
+        .map(|outcome| outcome.changed)
 }

@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use crate::cli::parser::TaskAddress;
 use crate::dispatch::{self, Delivery, DispatchHost, HostKind, StartRoute};
-use crate::domain::{actor_from_env, BlockKey, DomainError, DomainState, OWNER};
+use crate::domain::{
+    actor_from_env, block_text, ApplyError, BlockField, BlockKey, DomainError, DomainState, Intent,
+    ReplyKey, RoundIntent, OWNER,
+};
 use crate::store::{default_state_dir, TaskStore};
 
 /// A stored reply.
@@ -133,11 +136,33 @@ pub fn run_send_with_host(
                 .iter()
                 .find(|task| target.matches(task))
                 .map(|task| task.id);
-            let marked = id
-                .map(|id| state.mark_reply_sent(id, &result.record, result.index, text.trim()))
-                .transpose()
-                .map_err(|error| error.to_string())?
-                .unwrap_or(false);
+            let reply = id.and_then(|id| {
+                let block = state.get(id)?.block.as_ref()?;
+                (block.key() == result.record)
+                    .then(|| block.replies.get(result.index).map(ReplyKey::of))
+                    .flatten()
+                    .map(|reply| (id, reply))
+            });
+            let marked = match reply {
+                Some((task, reply)) => {
+                    let change = RoundIntent::MarkReplySent {
+                        task,
+                        record: result.record.clone(),
+                        reply,
+                        sent_text: text.trim().to_string(),
+                    };
+                    state
+                        .apply_local(
+                            &result.by,
+                            Intent::Round {
+                                change: Box::new(change),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?
+                        .changed
+                }
+                None => false,
+            };
             Ok(((), marked))
         });
     }
@@ -215,25 +240,49 @@ fn apply(
     if soft_deleted {
         return (Err(ReplyError::SoftDeletedTask), false);
     }
-    match state.reply(id, text, by) {
-        Ok(index) => (
+    let record = state
+        .get(id)
+        .and_then(|task| task.block.as_ref())
+        .map(|block| block.key());
+    let added = match record.clone() {
+        // The text refuses before a missing record, as the domain orders them.
+        None => match block_text(Some(text), BlockField::Reply) {
+            Err(field) => Err(DomainError::TextTooLong(field).into()),
+            Ok(None) => Err(DomainError::EmptyReply.into()),
+            Ok(Some(_)) => Err(DomainError::NotBlocked(id).into()),
+        },
+        Some(record) => state.apply_local(
+            by,
+            Intent::Round {
+                change: Box::new(RoundIntent::AddReply {
+                    task: id,
+                    record,
+                    text: text.to_string(),
+                }),
+            },
+        ),
+    };
+    match added {
+        Ok(_) => (
             Ok(ReplyResult {
                 number,
                 title,
                 by: by.to_string(),
-                index,
-                record: state
+                index: state
                     .get(id)
                     .and_then(|task| task.block.as_ref())
-                    .map(|block| block.key())
+                    .map(|block| block.replies.len() - 1)
                     .expect("a stored reply has its record"),
+                record: record.expect("a stored reply has its record"),
             }),
             true,
         ),
-        Err(DomainError::NotBlocked(_)) => (Err(ReplyError::NotBlocked), false),
-        Err(DomainError::EmptyReply) => (Err(ReplyError::EmptyReply), false),
-        Err(DomainError::TextTooLong(_)) => (Err(ReplyError::TextTooLong), false),
-        Err(DomainError::UnknownId(_)) => (Err(ReplyError::UnknownTask), false),
+        Err(ApplyError::Domain(DomainError::NotBlocked(_))) => (Err(ReplyError::NotBlocked), false),
+        Err(ApplyError::Domain(DomainError::EmptyReply)) => (Err(ReplyError::EmptyReply), false),
+        Err(ApplyError::Domain(DomainError::TextTooLong(_))) => {
+            (Err(ReplyError::TextTooLong), false)
+        }
+        Err(ApplyError::Domain(DomainError::UnknownId(_))) => (Err(ReplyError::UnknownTask), false),
         Err(other) => (Err(ReplyError::Store(other.to_string())), false),
     }
 }

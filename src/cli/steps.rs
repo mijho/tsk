@@ -6,7 +6,10 @@ use serde::Serialize;
 
 use crate::cli::add::has_c0_control;
 use crate::cli::parser::TaskAddress;
-use crate::domain::{DomainError, DomainState, Step};
+use crate::domain::{
+    current_actor, ApplyError, DomainError, DomainState, Intent, NewStep, Step, StepAnchor,
+    StepChange,
+};
 use crate::store::{default_state_dir, TaskStore};
 use uuid::Uuid;
 
@@ -151,9 +154,19 @@ fn apply(
                 Some(placement) => placement_index(steps, placement)?,
                 None => steps.len(),
             };
-            let step_id = domain
-                .insert_step(task_id, text, index)
-                .map_err(map_domain_error)?;
+            let step_id = Uuid::new_v4();
+            let anchor = anchor_at(steps, index);
+            change(
+                domain,
+                task_id,
+                StepChange::Insert {
+                    step: NewStep {
+                        id: step_id,
+                        text: text.to_owned(),
+                    },
+                    anchor,
+                },
+            )?;
             let steps = &domain.get(task_id).expect("task exists").steps;
             Ok((
                 StepsResult::Added {
@@ -166,9 +179,7 @@ fn apply(
         StepsAction::Toggle { short_id } => {
             let steps = domain.get(task_id).expect("task exists").steps.clone();
             let step_id = resolve_existing_step(&steps, short_id)?;
-            domain
-                .toggle_step(task_id, step_id)
-                .map_err(map_domain_error)?;
+            change(domain, task_id, StepChange::Toggle { step: step_id })?;
             let done = domain
                 .get(task_id)
                 .expect("task exists")
@@ -208,9 +219,14 @@ fn apply(
                 .as_str();
             let changed = current != text;
             if changed {
-                domain
-                    .rename_step(task_id, step_id, text)
-                    .map_err(map_domain_error)?;
+                change(
+                    domain,
+                    task_id,
+                    StepChange::Rename {
+                        step: step_id,
+                        text: text.to_owned(),
+                    },
+                )?;
             }
             Ok((
                 StepsResult::Renamed {
@@ -248,9 +264,15 @@ fn apply(
                 StepPlacement::First => 0,
                 StepPlacement::Last => others.len(),
             };
-            let changed = domain
-                .move_step(task_id, step_id, index)
-                .map_err(map_domain_error)?;
+            let anchor = anchor_at(&others, index);
+            let changed = change(
+                domain,
+                task_id,
+                StepChange::Move {
+                    step: step_id,
+                    anchor,
+                },
+            )?;
             let step = steps
                 .iter()
                 .find(|step| step.id == step_id)
@@ -275,9 +297,7 @@ fn apply(
                 .text
                 .clone();
             let printed = step_short_id(&steps, step_id);
-            domain
-                .remove_step(task_id, step_id)
-                .map_err(map_domain_error)?;
+            change(domain, task_id, StepChange::Remove { step: step_id })?;
             Ok((
                 StepsResult::Removed {
                     short_id: printed,
@@ -312,6 +332,31 @@ fn resolve_existing_step(steps: &[Step], short_id: &str) -> Result<Uuid, StepsEr
         ShortIdResolution::Ambiguous => Err(StepsError::AmbiguousStep),
         ShortIdResolution::None => Err(StepsError::UnknownStep),
     }
+}
+
+/// Apply one step change as a local op. CLI step verbs add no undo entry.
+fn change(domain: &mut DomainState, task: Uuid, change: StepChange) -> Result<bool, StepsError> {
+    domain
+        .apply_local(
+            &current_actor(),
+            Intent::Step {
+                task,
+                change,
+                undo: false,
+            },
+        )
+        .map(|outcome| outcome.changed)
+        .map_err(|error| match error {
+            ApplyError::Domain(error) => map_domain_error(error),
+            other => StepsError::Store(other.to_string()),
+        })
+}
+
+/// The stable anchor for inserting at `index` in `steps`.
+fn anchor_at(steps: &[Step], index: usize) -> StepAnchor {
+    index.checked_sub(1).map_or(StepAnchor::Start, |before| {
+        StepAnchor::After(steps[before].id)
+    })
 }
 
 /// Domain commands re-check what the boundary already validated; mirror the twins.

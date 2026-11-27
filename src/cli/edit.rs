@@ -7,7 +7,8 @@ use crate::agents::AgentProfiles;
 use crate::cli::add::has_c0_control;
 use crate::cli::parser::TaskAddress;
 use crate::domain::{
-    block_text, Assignee, BlockField, BlockKind, BlockOn, DomainError, DomainState, TaskScope,
+    block_text, current_actor, ApplyError, Assignee, BlockField, BlockKind, BlockOn, DomainError,
+    DomainState, Field, Intent, NotesEdit, RoundIntent, TaskPatch, TaskScope, WaitingOnChange,
 };
 use crate::store::{default_state_dir, TaskStore};
 use uuid::Uuid;
@@ -280,42 +281,61 @@ fn apply(
             false,
         );
     }
-    let fields_changed = next_title != found.title
-        || next_notes != found.notes
-        || next_thread != found.thread
-        || next_assignee != found.assignee
-        || next_base != found.base;
-    let edited = if fields_changed {
-        state.edit_with_assignee_and_base(
-            found.id,
-            &next_title,
-            next_notes,
-            found.scope,
-            next_thread,
-            next_assignee,
-            next_base,
-        )
-    } else {
-        Ok(())
+    // Field edits and after, then `--on`, then the due date: a later due change stales the
+    // `--on` undo entry, as the separate CLI mutations always did.
+    let set = |value: Option<String>| value.map_or(Field::Clear, Field::Set);
+    let mut intents = Vec::new();
+    let patch = TaskPatch {
+        title: (next_title != found.title).then(|| next_title.clone()),
+        notes: match (&fields.notes, &fields.append_notes) {
+            (None, Some(text)) => Some(NotesEdit::Append(text.clone())),
+            _ => (next_notes != found.notes).then(|| NotesEdit::Replace(set(next_notes.clone()))),
+        },
+        thread: (next_thread != found.thread).then(|| set(next_thread.clone())),
+        assignee: (next_assignee != found.assignee)
+            .then(|| next_assignee.clone().map_or(Field::Clear, Field::Set)),
+        base: (next_base != found.base).then(|| set(next_base.clone())),
+        after: changed_after.then(|| {
+            next_after
+                .iter()
+                .filter_map(|number| state.task_by_number(*number).map(|task| task.id))
+                .collect()
+        }),
+        ..TaskPatch::default()
     };
-    let edited = edited.and_then(|()| {
-        if changed_after {
-            state.edit_after(found.id, &next_after).map(|_| ())
-        } else {
-            Ok(())
-        }
-    });
-    let edited = edited.and_then(|()| match on {
-        Some(on) if changed_on => state.set_on(found.id, on).map(|_| ()),
-        _ => Ok(()),
-    });
-    let edited = edited.and_then(|()| {
-        if changed_due {
-            state.edit_due(found.id, next_due.clone()).map(|_| ())
-        } else {
-            Ok(())
-        }
-    });
+    if patch != TaskPatch::default() {
+        intents.push(Intent::EditTask {
+            task: found.id,
+            patch: Box::new(patch),
+        });
+    }
+    if let Some(on) = on.filter(|_| changed_on) {
+        let record = state
+            .get(found.id)
+            .and_then(|task| task.block.as_ref())
+            .map(|block| block.key())
+            .expect("a changed --on has an open record");
+        intents.push(Intent::Round {
+            change: Box::new(RoundIntent::SetOn {
+                changes: vec![WaitingOnChange {
+                    task: found.id,
+                    record,
+                    on,
+                }],
+            }),
+        });
+    }
+    if changed_due {
+        intents.push(Intent::SetDue {
+            task: found.id,
+            due: next_due.clone(),
+        });
+    }
+    let edited = match state.apply_local(&current_actor(), Intent::Transaction { intents }) {
+        Ok(_) => Ok(()),
+        Err(ApplyError::Domain(error)) => Err(error),
+        Err(other) => return (Err(EditError::Store(other.to_string())), false),
+    };
     match edited {
         Ok(()) => (
             Ok(EditResult {

@@ -20,6 +20,18 @@ pub struct Op {
     pub intent: Intent,
 }
 
+impl Op {
+    /// A locally originated op by `actor`: a fresh id and the wall clock.
+    pub fn local(actor: &str, intent: Intent) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            actor: actor.to_string(),
+            at: SystemTime::now(),
+            intent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum Intent {
@@ -258,6 +270,11 @@ impl std::fmt::Display for ApplyError {
 impl std::error::Error for ApplyError {}
 
 impl DomainState {
+    /// Apply `intent` as a local op by `actor`, now.
+    pub fn apply_local(&mut self, actor: &str, intent: Intent) -> Result<ApplyOutcome, ApplyError> {
+        self.apply(&Op::local(actor, intent))
+    }
+
     /// Apply an accepted domain intent with the envelope's time and actor.
     pub fn apply(&mut self, op: &Op) -> Result<ApplyOutcome, ApplyError> {
         with_mutation_inputs(op.at, op.id, &op.actor, || {

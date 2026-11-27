@@ -24,6 +24,27 @@ Local undo still addresses the current stack top. Purged-task restore still
 requires the store/authority to resolve the tombstone; domain `Restore` can
 only clear soft-delete on a retained task.
 
+### CLI routing
+
+Every mutating CLI verb resolves its input under the store lock, then applies
+one `Op::local` (fresh id, wall clock, the verb's actor). A verb's several
+changes share one op, so its events share one time.
+
+- `edit` is one `Transaction`: field patch and `after`, then `SetOn`, then
+  `SetDue`, keeping the `--on` undo entry's existing staleness.
+- `steps` turn positions into stable anchors. `checks set <n>` addresses the
+  check by round, text, and occurrence of that text.
+- `status started` carries `Check`, or `Override` with `--force`, so the gate
+  also holds under the lock.
+- Dispatch, cleanup, and release go through the shared `dispatch.rs` helpers
+  as `RecordDispatch`, `RecordCleanup`, `ReleaseStart`, and
+  `ResolveReleasedLaunch`. A released launch whose task changed since its
+  release still records its dispatch, unattributed, as before.
+- `trash restore` stays a store operation (see above).
+- The board's marked-set dispatch still calls `commit_launch_with_status`
+  directly: it records on a task deleted mid-launch, which `RecordDispatch`
+  refuses. Board routing decides that case.
+
 ## Tasks and lifecycle
 
 | Op and payload | Current entry points | Conflict and undo boundary |
