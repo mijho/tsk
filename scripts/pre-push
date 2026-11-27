@@ -1,0 +1,8 @@
+#!/bin/sh
+# Hard fork guard: refuse any push not going to mijho/tsk.
+# Install: cp scripts/pre-push .git/hooks/pre-push
+case "$2" in
+  *github.com[:/]mijho/tsk|*github.com[:/]mijho/tsk.git|*github.com[:/]mijho/tsk/) exit 0 ;;
+esac
+echo "pre-push: refusing push to $2 (hard fork: only mijho/tsk)" >&2
+exit 1

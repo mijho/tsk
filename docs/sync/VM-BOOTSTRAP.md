@@ -2,7 +2,8 @@
 
 ## Maintainer, once
 
-1. Create the VM. Give it GitHub push access to `mijho/tsk` (SSH key or `gh auth login`).
+1. Create the VM. Give it GitHub push access to `mijho/tsk` only: a deploy key on that repo,
+   or a fine-grained token scoped to it. Then nothing on the VM can write to `smarzban/tsk`.
 2. Open Shelley on the VM and paste the prompt below.
 
 ## Prompt for Shelley
@@ -11,7 +12,9 @@
 Set up this VM to develop tsk, then start the development loop.
 
 1. Clone git@github.com:mijho/tsk.git to ~/tsk on main. Add remote
-   upstream https://github.com/smarzban/tsk. Set git user.name/user.email to mine.
+   upstream https://github.com/smarzban/tsk and make it fetch-only:
+   git remote set-url --push upstream DISABLED-hard-fork
+   Install scripts/pre-push as .git/hooks/pre-push. Set git user.name/user.email to mine.
 2. Install build-essential, pkg-config, curl, python3, then rustup (minimal profile).
    rust-toolchain.toml pins the toolchain; let cargo install it on first build.
 3. Install stable tsk for tracking:

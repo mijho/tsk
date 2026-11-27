@@ -13,6 +13,9 @@ Continuous development on `main` from an exe.dev VM. tsk tracks the work. No PRs
    `~/.tsk`: a dev build can migrate the store to an unreleased format. Repo builds run
    only with `TSK_STATE_DIR=$(mktemp -d)`.
 6. Commit before ending a turn. Push only validated commits.
+7. Hard fork. Never push, open a PR, file an issue, or comment on `smarzban/tsk`.
+   `upstream` is fetch-only; push only to `origin` (`mijho/tsk`). `gh` in a fork targets
+   the parent by default: never run `gh pr`/`gh issue` without `-R mijho/tsk`.
 
 ## Roles
 
@@ -46,8 +49,8 @@ Continuous development on `main` from an exe.dev VM. tsk tracks the work. No PRs
 
 Every fifth done task, or first thing in a session:
 
-1. **Upstream**: `git fetch upstream && git merge upstream/main`. Resolve, green bar, push.
-   Merge, never rebase: `main` is published.
+1. **Upstream**: `git fetch upstream && git merge upstream/main`. Resolve, green bar, push to
+   `origin`. Merge, never rebase: `main` is published.
 2. **Board**: split tasks that took more than one round, add follow-ups found while
    building, close what the code made moot. Keep the next three tasks unambiguous.
 3. **Drift**: diff docs against `src/` for anything shipped since the last rotation.

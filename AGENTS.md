@@ -441,3 +441,6 @@ rules:
 This fork (`mijho/tsk`) builds the shared workspace on `main`, tracked on its own tsk
 board. Before any work read `docs/sync/PROCESS.md` (how: rounds, validator, push to `main`,
 no PRs) and `docs/sync/PLAN.md` (what). Everything above still holds.
+
+Hard fork: nothing ever goes to `smarzban/tsk`. No push, PR, issue, or comment there;
+`upstream` is fetch-only and only `origin` (`mijho/tsk`) receives pushes.
