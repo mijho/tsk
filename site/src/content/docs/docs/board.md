@@ -241,7 +241,7 @@ Palette **chain marked tasks in order** makes each marked task run after the one
 When the last prerequisite is done, each waiting **ready** task starts in the same save, and an assigned one [dispatches](/docs/dispatch/#dispatch). Review does not count as done. The status row says so, for example `T205 started · T202 done`. Waiting tasks in open, blocked, or review stay put.
 
 - A launch that fails puts the task back to ready and never blocks the done.
-- If you change that task's status before its launch lands, a failed launch leaves it as you set it.
+- If you change that task's status before its launch lands, a failed launch leaves it as you set it and says `T205 not launched`.
 - `ctrl+u` on the done reverts the statuses only. A launched agent keeps running.
 - Starting a waiting task yourself asks first: `Start anyway?`.
 - Deleting a task removes it from every after list, and `ctrl+u` restores the links. A ready task left waiting on nothing does not start.

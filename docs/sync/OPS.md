@@ -47,6 +47,14 @@ changes share one op, so its events share one time.
   pre-op code put it back to ready.
 - `trash restore` stays a store operation (see above).
 
+### Replay gate
+
+`tests/op_replay.rs` records every op a CLI and board session applies
+(`record_ops`), replays them in order on an empty state, numbering after each
+op as each save did, and requires the saved store's exact state. A mutation
+that bypasses `DomainState::apply` fails it. Trash restore and host I/O stay
+outside ops and outside the session.
+
 ### Board routing
 
 Every board mutation applies one `Op::local` by `you` through

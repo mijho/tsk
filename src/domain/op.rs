@@ -20,6 +20,25 @@ pub struct Op {
     pub intent: Intent,
 }
 
+thread_local! {
+    static RECORDED: std::cell::RefCell<Option<Vec<Op>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `work` and return every op this thread applied successfully during it, in order: the
+/// replay gate's recorder. Outside it nothing is recorded; a nested call keeps its own ops.
+pub fn record_ops<T>(work: impl FnOnce() -> T) -> (T, Vec<Op>) {
+    struct Restore(Option<Vec<Op>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECORDED.with(|recorded| *recorded.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(RECORDED.with(|recorded| recorded.borrow_mut().replace(Vec::new())));
+    let result = work();
+    let ops = RECORDED.with(|recorded| recorded.borrow_mut().take().unwrap_or_default());
+    (result, ops)
+}
+
 impl Op {
     /// A locally originated op by `actor`: a fresh id and the wall clock.
     pub fn local(actor: &str, intent: Intent) -> Self {
@@ -291,9 +310,17 @@ impl DomainState {
 
     /// Apply an accepted domain intent with the envelope's time and actor.
     pub fn apply(&mut self, op: &Op) -> Result<ApplyOutcome, ApplyError> {
-        with_mutation_inputs(op.at, op.id, &op.actor, || {
+        let outcome = with_mutation_inputs(op.at, op.id, &op.actor, || {
             self.apply_intent(&op.intent, &op.actor)
-        })
+        });
+        if outcome.is_ok() {
+            RECORDED.with(|recorded| {
+                if let Some(ops) = recorded.borrow_mut().as_mut() {
+                    ops.push(op.clone());
+                }
+            });
+        }
+        outcome
     }
 
     fn apply_intent(&mut self, intent: &Intent, actor: &str) -> Result<ApplyOutcome, ApplyError> {

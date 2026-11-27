@@ -325,7 +325,7 @@ This version writes store format 19. tsk 0.14 and older refuse a format 19 store
 
 To roll back: quit every board, then copy `tsk.json.v<N>` over `tsk.json`. Changes made since the upgrade are lost.
 
-After a rollback to tsk 0.14, deleted tasks set to run after another task are missing from trash, and its next trash change removes them for good.
+After a rollback to tsk 0.14, deleted tasks set to run after another task are missing from trash, and the next trash change tsk 0.14 makes removes them for good.
 
 ## Deleted tasks
 

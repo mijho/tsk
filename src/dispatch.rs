@@ -3429,7 +3429,9 @@ pub fn plan_released_with_host(
 
 /// Launch the agent of each released task `state` holds for a launch, after the save that
 /// started them, outside the store lock; save `state` afterwards. A launch records its dispatch
-/// on the started task; a refused or failed one puts the task back to ready.
+/// on the started task; a refused or failed one puts the task back to ready. A task whose
+/// status changed since its release keeps that change: a launch records its dispatch
+/// unattributed, and a failed one reports [`ReleasedStart::NotLaunchedChanged`].
 pub fn launch_released_with_host(
     state: &mut DomainState,
     state_dir: &Path,

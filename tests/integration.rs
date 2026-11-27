@@ -40,6 +40,7 @@ mod git_base;
 mod host_scripts;
 mod host_scripts_windows;
 mod manifest;
+mod op_replay;
 mod queue_board_edit;
 mod queue_board_groups;
 mod queue_board_model;
