@@ -42,7 +42,9 @@ changes share one op, so its events share one time.
   as `RecordDispatch`, `RecordCleanup`, `ReleaseStart`, and
   `ResolveReleasedLaunch`. A released launch resolves while the release is the
   task's latest status change, even after other edits. If a later status change
-  made it stale, a successful launch still records its dispatch, unattributed.
+  made it stale, a successful launch still records its dispatch, unattributed,
+  and a failed one leaves the task as that change left it (started), where the
+  pre-op code put it back to ready.
 - `trash restore` stays a store operation (see above).
 
 ### Board routing

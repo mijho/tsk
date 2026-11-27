@@ -308,8 +308,10 @@ fn migrate_with(
 /// dropped, as the store migration does. The next trash rewrite saves the ids.
 fn parse_trash_lines(
     content: &[u8],
-    numbers: &std::collections::BTreeMap<u64, serde_json::Value>,
+    numbers: impl FnOnce() -> std::collections::BTreeMap<u64, serde_json::Value>,
 ) -> Vec<TrashLine> {
+    // Built only when a line still names `after` by number.
+    let numbers = std::cell::LazyCell::new(numbers);
     let mut lines: Vec<TrashLine> = Vec::new();
     for entry in content
         .split(|byte| *byte == b'\n')
@@ -606,10 +608,10 @@ impl TaskStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        Ok(parse_trash_lines(&content, &self.task_numbers(&content)))
+        Ok(parse_trash_lines(&content, || self.task_numbers(&content)))
     }
 
-    /// Task number to task id, from the live document and the trash `content`, for trash lines
+    /// Task number to task id, from the trash `content` and the live document, for trash lines
     /// that still name `after` by number. Unreadable files contribute nothing.
     fn task_numbers(&self, content: &[u8]) -> std::collections::BTreeMap<u64, serde_json::Value> {
         let live = fs::read(self.state_file())
@@ -626,8 +628,10 @@ impl TaskStore {
             .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
             .filter_map(|line| line.get("task").cloned())
             .collect();
-        live_tasks
-            .chain(trashed.iter())
+        // A live task wins a number it shares with a trash line, as numbering does.
+        trashed
+            .iter()
+            .chain(live_tasks)
             .filter(|task| task.get("notice").is_none_or(serde_json::Value::is_null))
             .filter_map(|task| Some((task.get("number")?.as_u64()?, task.get("id")?.clone())))
             .collect()
@@ -1185,7 +1189,7 @@ impl TaskStore {
             Err(error) => return Err(error.into()),
         };
         let mut kept = String::new();
-        for entry in parse_trash_lines(&content, &self.task_numbers(&content)) {
+        for entry in parse_trash_lines(&content, || self.task_numbers(&content)) {
             if keep(&entry) {
                 kept.push_str(&serde_json::to_string(&entry)?);
                 kept.push('\n');
@@ -4198,6 +4202,53 @@ mod tests {
         assert_eq!(live.get(two).expect("restored").after, vec![one]);
     }
 
+    /// A number a live task shares with a trash line (after a whole-store restore rolled
+    /// numbering back) names the live task when an old trash line's `after` is read.
+    #[test]
+    fn a_v7_trash_after_number_names_the_live_task_over_a_trashed_one() {
+        let dir = temp_dir("v7-trash-collide");
+        let _guard = TempDirGuard(dir.clone());
+        let seeded = saved_with_titles(&dir, &["live one"]);
+        let live_one = seeded.tasks()[0].id;
+        let number = seeded.tasks()[0].number.expect("number");
+        let mut other = DomainState::new();
+        let make = |state: &mut DomainState, title: &str| {
+            state
+                .create(
+                    title,
+                    None,
+                    TaskScope::Global,
+                    ProvenanceOrigin::Manual,
+                    None,
+                )
+                .expect("create")
+        };
+        let (trashed_one, waiting) = (make(&mut other, "trashed one"), make(&mut other, "waiting"));
+        let line = |id: Uuid, number: u64, after: serde_json::Value| {
+            let mut task = other.get(id).expect("task").clone();
+            task.number = Some(number);
+            let mut line = serde_json::to_value(TrashLine {
+                deleted_at: SystemTime::now(),
+                task,
+            })
+            .expect("line");
+            line["task"]["after"] = after;
+            line.to_string()
+        };
+        let content = format!(
+            "{}\n{}\n",
+            line(trashed_one, number, serde_json::json!([])),
+            line(waiting, number + 50, serde_json::json!([number]))
+        );
+        fs::write(dir.join(TRASH_FILE), content).expect("trash");
+        let trash = TaskStore::new(&dir).load_trash().expect("trash");
+        let read = trash
+            .iter()
+            .find(|line| line.task.id == waiting)
+            .expect("the v7 line reads");
+        assert_eq!(read.task.after, vec![live_one]);
+    }
+
     /// Trash purge unlinks a leftover `after` link once, on the copy that goes to disk. The
     /// caller takes that copy, so its next edit of the task saves rather than seeing the task
     /// as changed during save.
@@ -4361,7 +4412,7 @@ mod tests {
             "deleted_at": [1793817827, 0],
             "task": document["tasks"][0],
         });
-        let lines = parse_trash_lines(format!("{line}\n").as_bytes(), &Default::default());
+        let lines = parse_trash_lines(format!("{line}\n").as_bytes(), Default::default);
         assert_eq!(lines.len(), 1, "the pre-host line parses");
         let record = lines[0].task.dispatch.clone().expect("record");
         assert_eq!(record.host, crate::domain::AgentHost::Herdr);
@@ -4399,7 +4450,7 @@ mod tests {
                 "deleted_at": [1793817827, 0],
                 "task": document["tasks"][0],
             });
-            let lines = parse_trash_lines(format!("{line}\n").as_bytes(), &Default::default());
+            let lines = parse_trash_lines(format!("{line}\n").as_bytes(), Default::default);
             let record = lines[0].task.dispatch.clone().expect("trash record");
             assert_eq!(record.host, host, "trash line for {session}");
         }

@@ -259,15 +259,15 @@ impl std::fmt::Display for ApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Domain(error) => error.fmt(f),
-            Self::WaitingOn {
-                task,
-                prerequisites,
-            } => write!(f, "task {task} still waits on {prerequisites:?}"),
+            Self::WaitingOn { prerequisites, .. } => {
+                let list: Vec<String> = prerequisites.iter().map(|n| format!("T{n}")).collect();
+                write!(f, "the task still waits on {}", list.join(", "))
+            }
             Self::DuplicateId(id) => write!(f, "id {id} already exists"),
             Self::UnnumberedPrerequisite(id) => write!(f, "prerequisite {id} has no task number"),
             Self::InvalidIntent(reason) => f.write_str(reason),
-            Self::StaleRound(id) => write!(f, "the open round on task {id} changed"),
-            Self::StaleDispatch(id) => write!(f, "the dispatch on task {id} changed"),
+            Self::StaleRound(_) => f.write_str("that block or review changed elsewhere"),
+            Self::StaleDispatch(_) => f.write_str("that task's dispatch changed elsewhere"),
         }
     }
 }

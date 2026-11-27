@@ -325,6 +325,8 @@ This version writes store format 19. tsk 0.14 and older refuse a format 19 store
 
 To roll back: quit every board, then copy `tsk.json.v<N>` over `tsk.json`. Changes made since the upgrade are lost.
 
+After a rollback to tsk 0.14, deleted tasks that ran after another task may be missing from trash.
+
 ## Deleted tasks
 
 A deleted task moves to `trash.jsonl` once undo can no longer bring it back, or after seven days. Trash is purged 30 days after deletion.

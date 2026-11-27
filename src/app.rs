@@ -19284,6 +19284,50 @@ mod quick_assign_tests {
             );
         }
 
+        /// Start anyway, then `y` on the bulk card: the launch lands and the waiting start-only
+        /// row starts too, past the prerequisite the first card already asked about.
+        #[test]
+        fn start_anyway_then_the_bulk_card_starts_the_waiting_row_too() {
+            let temp = Temp::new("bulk-after-anyway", &["builder"]);
+            let (mut domain, mut model, ids) = board(&temp, &["prerequisite", "launches", "waits"]);
+            assign(&mut domain, ids[1]);
+            domain.set_after(ids[2], &[ids[0]]).expect("after");
+            temp.store.reload_merge_save(&mut domain).expect("save");
+            domain
+                .set_status(ids[2], HumanStatus::Ready)
+                .expect("ready");
+            marked(&mut domain, &mut model, &temp, &ids[1..]);
+            let mut host = fake_host(&temp);
+            let mut recovery = SaveRecovery::new();
+            let mut names = Vec::new();
+            step(
+                &temp,
+                &mut domain,
+                &mut model,
+                BoardIntent::PrimaryVerb,
+                &mut recovery,
+                &mut host,
+                &mut names,
+            );
+            assert!(model
+                .dispatch_prompt()
+                .is_some_and(|prompt| prompt.start_anyway.is_some()));
+            for _ in 0..2 {
+                step(
+                    &temp,
+                    &mut domain,
+                    &mut model,
+                    BoardIntent::ConfirmDispatch,
+                    &mut recovery,
+                    &mut host,
+                    &mut names,
+                );
+            }
+            assert_eq!(host.launched, 1);
+            assert!(saved(&temp, ids[1]).dispatch.is_some());
+            assert_eq!(saved(&temp, ids[2]).status, HumanStatus::Started);
+        }
+
         /// A launch that fails is reported, names no agent, and does not stop the others.
         #[test]
         fn one_failed_launch_in_a_bulk_dispatch_does_not_stop_the_others() {
@@ -20979,6 +21023,49 @@ mod quick_assign_tests {
         );
         assert_eq!(status_of(&domain, ids[2]), HumanStatus::Started);
         assert_eq!(status_of(&domain, ids[1]), HumanStatus::Started);
+    }
+
+    /// The reply box's `ctrl+s` on a blocked task that waits on another, whose agent is gone,
+    /// then `n` on the relaunch card: the unblock starts it, with no prerequisite gate of its
+    /// own, as a reply-box unblock never had one.
+    #[test]
+    fn a_reply_box_unblock_then_start_without_relaunch_starts_a_waiting_task() {
+        let temp = Temp::new("after-reply-relaunch-n", &["builder"]);
+        let (mut domain, mut model, ids) = board(&temp, &["first", "agent asks"]);
+        dispatched_before(&temp, &mut domain, &mut model, ids[1], HumanStatus::Started);
+        domain.set_after(ids[1], &[ids[0]]).expect("after");
+        temp.store.reload_merge_save(&mut domain).expect("save");
+        blocked_row(&temp, &mut domain, &mut model, ids[1]);
+        let mut host = fake_host(&temp);
+        host.agent = Some(false);
+        apply_intent(&mut domain, &mut model, BoardIntent::BeginReply, None).expect("r");
+        apply_intent(
+            &mut domain,
+            &mut model,
+            BoardIntent::EditInsertText("use postgres".into()),
+            None,
+        )
+        .expect("type");
+        handle(
+            &temp,
+            &mut domain,
+            &mut model,
+            BoardIntent::ReplySaveUnblock,
+            &mut host,
+        );
+        assert!(model
+            .dispatch_prompt()
+            .is_some_and(|prompt| prompt.relaunch.is_some()));
+        handle(
+            &temp,
+            &mut domain,
+            &mut model,
+            BoardIntent::StartWithoutRelaunch,
+            &mut host,
+        );
+        assert_eq!(host.ran, 0, "nothing relaunched");
+        let disk = temp.store.load().expect("load");
+        assert_eq!(status_of(&disk, ids[1]), HumanStatus::Started);
     }
 
     /// Start anyway, then `n` on the relaunch card that follows: the start the card agreed to

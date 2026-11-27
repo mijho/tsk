@@ -125,7 +125,10 @@ impl DispatchIntent {
                 }
                 let previous = target.status;
                 if let Some(start) = start {
-                    if start.prerequisite_policy == PrerequisitePolicy::Check {
+                    // Like every start gate, only a start that moves the status is checked.
+                    if start.prerequisite_policy == PrerequisitePolicy::Check
+                        && previous != HumanStatus::Started
+                    {
                         check_waiting(state, target)?;
                     }
                     result.status_conflicts.extend(conflict(target, start.from));
@@ -620,5 +623,80 @@ mod tests {
         let task = state.get(id).unwrap();
         assert!(task.soft_deleted && task.dispatch.is_some());
         assert_eq!(task.status, HumanStatus::Open);
+    }
+
+    /// A hand-made status change after the release (blocked, then started again) makes the
+    /// release stale: neither outcome lands, and nothing changes.
+    #[test]
+    fn a_release_outcome_after_a_later_status_change_refuses_and_changes_nothing() {
+        let mut state = DomainState::new();
+        let prerequisite = task(&mut state, "prerequisite");
+        let id = task(&mut state, "waiting");
+        state.assign_numbers_for_persistence();
+        state.set_after(id, &[prerequisite]).unwrap();
+        state.set_status(id, HumanStatus::Ready).unwrap();
+        state.complete(prerequisite).unwrap();
+        let start = DispatchIntent::ReleaseStart {
+            task: id,
+            prerequisite,
+        };
+        assert!(start.apply(&mut state).unwrap().changed);
+        state.set_status(id, HumanStatus::Blocked).unwrap();
+        state.set_status(id, HumanStatus::Started).unwrap();
+        let expected_revision = state.get(id).unwrap().revision;
+        let before = serde_json::to_value(&state).unwrap();
+        for outcome in [
+            ReleasedLaunchOutcome::Failed,
+            ReleasedLaunchOutcome::Succeeded {
+                record: Box::new(dispatch("late")),
+            },
+        ] {
+            let resolve = DispatchIntent::ResolveReleasedLaunch {
+                task: id,
+                prerequisite,
+                expected_revision,
+                outcome,
+            };
+            assert_eq!(
+                resolve.apply(&mut state),
+                Err(ApplyError::InvalidIntent(
+                    "launch result must refer to the target's release start"
+                ))
+            );
+            assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        }
+    }
+
+    /// A dispatch that checks prerequisites gates only a start that moves the status: an
+    /// already-started task that still waits records its launch.
+    #[test]
+    fn a_checked_dispatch_on_an_already_started_task_does_not_gate() {
+        let mut state = DomainState::new();
+        let prerequisite = task(&mut state, "prerequisite");
+        let id = task(&mut state, "waiting");
+        state.assign_numbers_for_persistence();
+        state.set_after(id, &[prerequisite]).unwrap();
+        let record = |from| DispatchIntent::RecordDispatch {
+            task: id,
+            expected: DispatchGuard::Dispatch { expected: None },
+            record: Box::new(dispatch("checked")),
+            start: Some(DispatchStart {
+                from,
+                prerequisite_policy: PrerequisitePolicy::Check,
+                undo: false,
+            }),
+        };
+        assert!(matches!(
+            record(HumanStatus::Open).apply(&mut state),
+            Err(ApplyError::WaitingOn { .. })
+        ));
+        state.set_status(id, HumanStatus::Started).unwrap();
+        assert!(
+            record(HumanStatus::Started)
+                .apply(&mut state)
+                .unwrap()
+                .changed
+        );
+        assert!(state.get(id).unwrap().dispatch.is_some());
     }
 }
