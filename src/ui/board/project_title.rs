@@ -203,7 +203,11 @@ pub(super) fn confirm_project_title(
         model.follow_project(&path);
         return Ok(IntentOutcome::None);
     }
-    match domain.set_project_title(&path, draft.as_deref().unwrap_or("")) {
+    let intent = crate::domain::Intent::SetProjectTitle {
+        project: path.clone(),
+        title: draft,
+    };
+    match super::apply_op(domain, intent) {
         Ok(true) => {
             let saved = domain.project_title(&path).map(str::to_string);
             if let Some(edit) = model.project_title_edit.as_mut() {

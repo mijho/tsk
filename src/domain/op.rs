@@ -65,6 +65,11 @@ pub enum Intent {
         to: HumanStatus,
         prerequisite_policy: PrerequisitePolicy,
     },
+    /// The board start card's marked set: one batch of start undo entries.
+    StartBatch {
+        tasks: Vec<StatusSource>,
+        prerequisite_policy: PrerequisitePolicy,
+    },
     EditTask {
         task: Uuid,
         patch: Box<TaskPatch>,
@@ -269,6 +274,15 @@ impl std::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
+impl From<ApplyError> for DomainError {
+    fn from(error: ApplyError) -> Self {
+        match error {
+            ApplyError::Domain(error) => error,
+            other => Self::Refused(other.to_string()),
+        }
+    }
+}
+
 impl DomainState {
     /// Apply `intent` as a local op by `actor`, now.
     pub fn apply_local(&mut self, actor: &str, intent: Intent) -> Result<ApplyOutcome, ApplyError> {
@@ -399,45 +413,32 @@ impl DomainState {
                 to,
                 prerequisite_policy,
             } => {
-                let ids: Vec<_> = tasks.iter().map(|target| target.task).collect();
-                self.prevalidate_batch_ids(&ids)?;
-                let mut changed = false;
-                for target in tasks {
-                    let task = self
-                        .get(target.task)
-                        .ok_or(DomainError::UnknownId(target.task))?;
-                    if task.soft_deleted {
-                        return Err(DomainError::SoftDeleted(task.id).into());
-                    }
-                    if task.status != *to {
-                        check_new_status_round(task, *to, actor)?;
-                    }
-                    if task.status != target.from {
-                        status_conflicts.push(StatusConflict {
-                            task: task.id,
-                            expected: target.from,
-                            actual: task.status,
-                        });
-                    }
-                    if *to == HumanStatus::Started
-                        && *prerequisite_policy == PrerequisitePolicy::Check
-                    {
-                        let prerequisites = self.waiting_on(task);
-                        if !prerequisites.is_empty() {
-                            return Err(ApplyError::WaitingOn {
-                                task: task.id,
-                                prerequisites,
-                            });
-                        }
-                    }
-                    changed |= task.status != *to;
-                }
+                let (ids, changed) = self.check_status_batch(
+                    tasks,
+                    *to,
+                    *prerequisite_policy,
+                    actor,
+                    &mut status_conflicts,
+                )?;
                 if *to == HumanStatus::Done {
                     self.complete_batch(&ids)?;
                     changed
                 } else {
                     self.change_status(&ids, *to, true)?
                 }
+            }
+            Intent::StartBatch {
+                tasks,
+                prerequisite_policy,
+            } => {
+                let (ids, _) = self.check_status_batch(
+                    tasks,
+                    HumanStatus::Started,
+                    *prerequisite_policy,
+                    actor,
+                    &mut status_conflicts,
+                )?;
+                self.start_batch(&ids)?
             }
             Intent::EditTask { task, patch } => self.apply_patch(*task, patch)?,
             Intent::SetAssignee { tasks, assignee } => {
@@ -522,6 +523,50 @@ impl DomainState {
             changed,
             status_conflicts,
         })
+    }
+
+    /// Validate a status batch before any change: prevalidated ids, live targets, round keys,
+    /// `from` conflicts, and the prerequisite gate. Returns the ids and whether any moves.
+    fn check_status_batch(
+        &self,
+        tasks: &[StatusSource],
+        to: HumanStatus,
+        prerequisite_policy: PrerequisitePolicy,
+        actor: &str,
+        status_conflicts: &mut Vec<StatusConflict>,
+    ) -> Result<(Vec<Uuid>, bool), ApplyError> {
+        let ids: Vec<_> = tasks.iter().map(|target| target.task).collect();
+        self.prevalidate_batch_ids(&ids)?;
+        let mut changed = false;
+        for target in tasks {
+            let task = self
+                .get(target.task)
+                .ok_or(DomainError::UnknownId(target.task))?;
+            if task.soft_deleted {
+                return Err(DomainError::SoftDeleted(task.id).into());
+            }
+            if task.status != to {
+                check_new_status_round(task, to, actor)?;
+            }
+            if task.status != target.from {
+                status_conflicts.push(StatusConflict {
+                    task: task.id,
+                    expected: target.from,
+                    actual: task.status,
+                });
+            }
+            if to == HumanStatus::Started && prerequisite_policy == PrerequisitePolicy::Check {
+                let prerequisites = self.waiting_on(task);
+                if !prerequisites.is_empty() {
+                    return Err(ApplyError::WaitingOn {
+                        task: task.id,
+                        prerequisites,
+                    });
+                }
+            }
+            changed |= task.status != to;
+        }
+        Ok((ids, changed))
     }
 
     fn apply_patch(&mut self, task: Uuid, patch: &TaskPatch) -> Result<bool, ApplyError> {
@@ -710,7 +755,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
-    use crate::domain::{ProvenanceOrigin, TaskScope};
+    use crate::domain::{ProvenanceOrigin, TaskScope, UndoEntry};
 
     fn envelope(intent: Intent) -> Op {
         Op {
@@ -1214,5 +1259,60 @@ mod tests {
             prerequisite_policy: PrerequisitePolicy::NotApplicable,
             undo,
         }
+    }
+
+    /// The start card's marked set is one batch of start entries; the gate refuses a waiting
+    /// task before any of the set moves.
+    #[test]
+    fn start_batch_checks_the_gate_and_keeps_one_start_batch_undo() {
+        let mut state = DomainState::new();
+        let make = |state: &mut DomainState, title| {
+            state
+                .create(
+                    title,
+                    None,
+                    TaskScope::Global,
+                    ProvenanceOrigin::Manual,
+                    None,
+                )
+                .unwrap()
+        };
+        let (first, second, waiting) = (
+            make(&mut state, "first"),
+            make(&mut state, "second"),
+            make(&mut state, "waiting"),
+        );
+        state.assign_numbers_for_persistence();
+        let number = state.get(first).unwrap().number.unwrap();
+        state.set_after(waiting, &[number]).unwrap();
+        let batch = |tasks: &[Uuid], policy| Intent::StartBatch {
+            tasks: tasks
+                .iter()
+                .map(|task| StatusSource {
+                    task: *task,
+                    from: HumanStatus::Open,
+                })
+                .collect(),
+            prerequisite_policy: policy,
+        };
+        let before = serde_json::to_value(&state).unwrap();
+        assert!(matches!(
+            apply(&mut state, 2, batch(&[second, waiting], PrerequisitePolicy::Check)),
+            Err(ApplyError::WaitingOn { task, .. }) if task == waiting
+        ));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        let started = apply(
+            &mut state,
+            3,
+            batch(&[first, second], PrerequisitePolicy::Check),
+        );
+        assert!(started.unwrap().changed);
+        assert!(matches!(
+            state.last_undo(),
+            Some(UndoEntry::Batch { entries })
+                if entries.len() == 2
+                    && entries.iter().all(|entry| matches!(entry, UndoEntry::Start { .. }))
+        ));
+        assert_eq!(state.get(second).unwrap().status, HumanStatus::Started);
     }
 }

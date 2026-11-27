@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::context::InvocationSnapshot;
 use crate::domain::{
-    normalize_thread, resolve_assignee, thread_refusal_message, Assignee, DomainError, DomainState,
-    TaskScope,
+    current_actor, normalize_thread, resolve_assignee, thread_refusal_message, Assignee,
+    DomainError, DomainState, Intent, NewStep, ProvenanceOrigin, TaskScope,
 };
 use crate::store::{StoreError, TaskStore};
 
@@ -72,7 +72,21 @@ pub fn capture_save(
     thread: Option<String>,
 ) -> Result<TaskId, CaptureError> {
     let scope = scope_override.unwrap_or_else(|| snapshot.default_scope.clone());
-    let id = state.create(title, notes, scope, snapshot.provenance, thread)?;
+    let id = create(
+        state,
+        Create {
+            title: title.as_ref(),
+            notes,
+            scope,
+            provenance: snapshot.provenance,
+            thread,
+            assignee: None,
+            base: None,
+            due: None,
+            after: &[],
+            steps: &[],
+        },
+    )?;
     if let Some(store) = store {
         // Merge with any concurrent writer before persist (board + capture).
         store.reload_merge_save(state)?;
@@ -93,6 +107,8 @@ pub fn capture_save_configured(
     assignee: Option<Assignee>,
     base: Option<String>,
     due: Option<String>,
+    after: &[u64],
+    steps: &[String],
 ) -> Result<TaskId, CaptureError> {
     let scope = scope_override.unwrap_or_else(|| snapshot.default_scope.clone());
     // A bad day refuses before the create, so a refusal never leaves a half-made task behind.
@@ -106,19 +122,76 @@ pub fn capture_save_configured(
             .map_err(CaptureError::UnknownBase)?;
     }
 
-    let id = state.create_configured(
-        title,
-        notes,
-        scope,
-        snapshot.provenance,
-        thread,
-        assignee,
-        base,
+    let id = create(
+        state,
+        Create {
+            title: title.as_ref(),
+            notes,
+            scope,
+            provenance: snapshot.provenance,
+            thread,
+            assignee,
+            base,
+            due,
+            after,
+            steps,
+        },
     )?;
-    state.set_due_on_create(id, due)?;
     if let Some(store) = store {
         store.reload_merge_save(state)?;
     }
+    Ok(id)
+}
+
+/// What a capture creates.
+struct Create<'a> {
+    title: &'a str,
+    notes: Option<String>,
+    scope: TaskScope,
+    provenance: ProvenanceOrigin,
+    thread: Option<String>,
+    assignee: Option<Assignee>,
+    base: Option<String>,
+    due: Option<String>,
+    after: &'a [u64],
+    steps: &'a [String],
+}
+
+/// Create the task as one op, with fresh task and step ids.
+fn create(state: &mut DomainState, task: Create<'_>) -> Result<TaskId, DomainError> {
+    let id = Uuid::new_v4();
+    let after = task
+        .after
+        .iter()
+        .map(|number| {
+            state
+                .task_by_number(*number)
+                .map(|task| task.id)
+                .ok_or(DomainError::AfterUnknown(*number))
+        })
+        .collect::<Result<_, _>>()?;
+    let steps = task
+        .steps
+        .iter()
+        .map(|text| NewStep {
+            id: Uuid::new_v4(),
+            text: text.clone(),
+        })
+        .collect();
+    let intent = Intent::Create {
+        task: id,
+        title: task.title.to_string(),
+        notes: task.notes,
+        scope: task.scope,
+        provenance: task.provenance,
+        thread: task.thread,
+        assignee: task.assignee,
+        base: task.base,
+        due: task.due,
+        after,
+        steps,
+    };
+    state.apply_local(&current_actor(), intent)?;
     Ok(id)
 }
 
@@ -401,6 +474,8 @@ mod tests {
             None,
             None,
             Some("2026-11-30".into()),
+            &[],
+            &[],
         )
         .expect("create");
         assert_eq!(
@@ -420,6 +495,8 @@ mod tests {
             None,
             None,
             Some("2026-02-30".into()),
+            &[],
+            &[],
         );
         assert!(matches!(
             result,
@@ -444,6 +521,8 @@ mod tests {
             None,
             Some("main".into()),
             None,
+            &[],
+            &[],
         );
         assert!(matches!(result, Err(CaptureError::UnknownBase(_))));
         assert_eq!(

@@ -3815,10 +3815,46 @@ pub fn run_with_host_base(
     base_override: Option<&str>,
     host: &mut impl DispatchHost,
 ) -> Result<DispatchResult, DispatchError> {
+    launch_and_commit(
+        state,
+        id,
+        profiles,
+        again,
+        host_kind,
+        base_override,
+        false,
+        host,
+    )
+}
+
+/// [`run_with_host`] for the board's single start: a start that moves the status gets
+/// status-only undo in the same op as the record.
+pub fn run_with_host_start_undo(
+    state: &mut DomainState,
+    id: Uuid,
+    profiles: &AgentProfiles,
+    again: bool,
+    host_kind: HostKind,
+    host: &mut impl DispatchHost,
+) -> Result<DispatchResult, DispatchError> {
+    launch_and_commit(state, id, profiles, again, host_kind, None, true, host)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_and_commit(
+    state: &mut DomainState,
+    id: Uuid,
+    profiles: &AgentProfiles,
+    again: bool,
+    host_kind: HostKind,
+    base_override: Option<&str>,
+    start_undo: bool,
+    host: &mut impl DispatchHost,
+) -> Result<DispatchResult, DispatchError> {
     let eligible = check_with_host(state, id, profiles, again, host_kind, host)?;
     let launched = launch_with_host(&eligible, base_override, host)?;
     let (record, undo) = (launched.record.clone(), launched.undo.clone());
-    commit_launch(state, eligible, launched)
+    commit_launch(state, eligible, launched, start_undo)
         .map_err(|error| unrecorded(host, &record, &undo, error))
 }
 
@@ -4795,6 +4831,7 @@ pub fn commit_launch(
     state: &mut DomainState,
     eligible: EligibleDispatch,
     launched: Launched,
+    start_undo: bool,
 ) -> Result<DispatchResult, DispatchError> {
     let from = state
         .get(eligible.id)
@@ -4803,7 +4840,7 @@ pub fn commit_launch(
     let start = DispatchStart {
         from,
         prerequisite_policy: PrerequisitePolicy::NotApplicable,
-        undo: false,
+        undo: start_undo,
     };
     record_launch(state, &eligible, &launched, Some(start))
         .map_err(|error| DispatchError::Store(error.to_string()))?;
@@ -4843,16 +4880,23 @@ fn apply_dispatch(state: &mut DomainState, change: DispatchIntent) -> Result<(),
 }
 
 /// [`commit_launch`] for the board's marked-set dispatch, starting the task only when `start`
-/// is set. It records on a task deleted while its agent launched, which the dispatch op
-/// refuses, so it stays a direct mutation until the board routes through ops.
+/// is set. A task deleted while its agent launched keeps the record without a start.
 pub fn commit_launch_with_status(
     state: &mut DomainState,
     eligible: EligibleDispatch,
     launched: Launched,
     start: bool,
 ) -> Result<DispatchResult, DispatchError> {
-    state
-        .record_dispatch_with_status(eligible.id, launched.record.clone(), start)
+    let from = state
+        .get(eligible.id)
+        .ok_or(DispatchError::UnknownTask)?
+        .status;
+    let start = start.then_some(DispatchStart {
+        from,
+        prerequisite_policy: PrerequisitePolicy::NotApplicable,
+        undo: false,
+    });
+    record_launch(state, &eligible, &launched, start)
         .map_err(|error| DispatchError::Store(error.to_string()))?;
     Ok(launch_result(eligible, launched))
 }

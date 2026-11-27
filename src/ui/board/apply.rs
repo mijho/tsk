@@ -7,8 +7,9 @@ use uuid::Uuid;
 
 use crate::context::InvocationSnapshot;
 use crate::domain::{
-    normalize_thread, status_word, thread_refusal_message, DomainError, DomainState, HumanStatus,
-    Task, TaskScope, ThreadError, UndoEntry,
+    normalize_thread, status_word, thread_refusal_message, DomainError, DomainState, Field,
+    FormSteps, HumanStatus, Intent, NewStep, NotesEdit, PrerequisitePolicy, StepAnchor, StepChange,
+    Task, TaskPatch, TaskScope, ThreadError, UndoEntry,
 };
 use crate::scope::paths_equivalent;
 use crate::ui::capture::{CaptureField, TITLE_REQUIRED_MESSAGE};
@@ -459,6 +460,19 @@ pub fn board_intent_may_persist(model: &BoardModel, intent: &BoardIntent) -> boo
         )
 }
 
+/// Archive or unarchive a project as a board op.
+fn project_archived(
+    domain: &mut DomainState,
+    project: &str,
+    archived: bool,
+) -> Result<bool, DomainError> {
+    let intent = Intent::SetProjectArchived {
+        project: project.to_string(),
+        archived,
+    };
+    super::apply_op(domain, intent)
+}
+
 /// `ctrl+u` on the picker's main tab: undo the top entry when it is a title change, else
 /// nothing (the main tab's `ctrl+u` stays inert for every other undo).
 fn undo_project_title_in_picker(
@@ -469,8 +483,8 @@ fn undo_project_title_in_picker(
         return Ok(IntentOutcome::None);
     };
     let note = UndoNote::read(domain, &entry);
-    match domain.undo() {
-        Ok(()) => {}
+    match super::apply_op(domain, Intent::Undo) {
+        Ok(_) => {}
         Err(DomainError::StaleProjectUndo(path)) => {
             model.set_message(format!(
                 "{} changed since its title change; nothing undone",
@@ -1521,7 +1535,13 @@ fn apply_board_intent(
             {
                 return Ok(IntentOutcome::None);
             }
-            domain.complete(id)?;
+            super::status_op(
+                domain,
+                &[id],
+                HumanStatus::Done,
+                false,
+                PrerequisitePolicy::NotApplicable,
+            )?;
         }
         BoardIntent::ReplyApprove => {
             // The application boundary approves a review; anything else lands here.
@@ -1988,12 +2008,10 @@ fn apply_board_intent(
                     assignee,
                     base,
                     due,
+                    &after,
+                    &pending_adds,
                 ) {
                     Ok(id) => {
-                        domain.set_after_on_create(id, &after)?;
-                        for text in &pending_adds {
-                            domain.add_step(id, text)?;
-                        }
                         let expanded_quick_add = model.quick_add.is_some();
                         if expanded_quick_add {
                             // The app save boundary still owns this create. Retain the expanded
@@ -2435,10 +2453,14 @@ fn apply_board_intent(
             let checked = match target.ids.as_slice() {
                 [] => domain.check_new_after(&after),
                 ids if target.edit_draft => domain.check_after(ids[0], &after),
-                ids => {
-                    let mut work = domain.clone();
-                    work.set_after_batch(ids, &after).map(|_| ())
-                }
+                ids => super::after_ids(domain, &after).and_then(|after| {
+                    let intent = Intent::SetAfter {
+                        tasks: ids.to_vec(),
+                        after,
+                        undo: true,
+                    };
+                    super::apply_op(&mut domain.clone(), intent).map(|_| ())
+                }),
             };
             if let Err(error) = checked {
                 model.set_message(error.to_string());
@@ -2454,7 +2476,12 @@ fn apply_board_intent(
                 }
                 return Ok(IntentOutcome::None);
             }
-            let changed = domain.set_after_batch(&target.ids, &after)?;
+            let intent = Intent::SetAfter {
+                tasks: target.ids.clone(),
+                after: super::after_ids(domain, &after)?,
+                undo: true,
+            };
+            let changed = super::apply_op(domain, intent)?;
             model.clear_marks();
             if !changed {
                 return Ok(IntentOutcome::None);
@@ -2485,7 +2512,7 @@ fn apply_board_intent(
                 model.set_message(CHAIN_NEEDS_MARKS);
                 return Ok(IntentOutcome::None);
             }
-            if let Err(error) = domain.chain_after(&ids) {
+            if let Err(error) = super::apply_op(domain, Intent::ChainAfter { tasks: ids.clone() }) {
                 model.set_message(error.to_string());
                 return Ok(IntentOutcome::None);
             }
@@ -2579,7 +2606,11 @@ fn apply_board_intent(
                     }
                 }
             }
-            let changed = domain.set_base_batch(&target.ids, base.clone())?;
+            let intent = Intent::SetBase {
+                tasks: target.ids.clone(),
+                base: base.clone(),
+            };
+            let changed = super::apply_op(domain, intent)?;
             model.clear_marks();
             if !changed {
                 return Ok(IntentOutcome::None);
@@ -2622,7 +2653,11 @@ fn apply_board_intent(
             let Some(target) = model.close_assignee_picker() else {
                 return Ok(IntentOutcome::None);
             };
-            let changed = domain.assign_batch(&target.ids, assignee.clone())?;
+            let intent = Intent::SetAssignee {
+                tasks: target.ids.clone(),
+                assignee: assignee.clone(),
+            };
+            let changed = super::apply_op(domain, intent)?;
             model.clear_marks();
             if !changed {
                 return Ok(IntentOutcome::None);
@@ -3007,7 +3042,7 @@ fn apply_board_intent(
             let Some((task_id, step_id)) = selected_step(domain, model) else {
                 return Ok(IntentOutcome::None);
             };
-            domain.with_steps_undo(task_id, |domain| domain.toggle_step(task_id, step_id))?;
+            super::step_op(domain, task_id, StepChange::Toggle { step: step_id })?;
         }
         BoardIntent::DispatchAgain => {
             // Host work and its one durable save are owned by the application boundary.
@@ -3067,7 +3102,12 @@ fn apply_board_intent(
                 return Ok(IntentOutcome::None);
             };
             // One undo step per move, like every other step change (T241).
-            domain.with_steps_undo(task_id, |domain| domain.move_step(task_id, step_id, target))?;
+            let anchor = super::move_anchor(domain, task_id, step_id, target);
+            let change = StepChange::Move {
+                step: step_id,
+                anchor,
+            };
+            super::step_op(domain, task_id, change)?;
             // The renderer-recorded heights are source-aligned; reorder them with the step so
             // the scroll below measures the new layout, not the one painted before the move.
             {
@@ -3127,7 +3167,8 @@ fn apply_board_intent(
                     moving.len()
                 ));
             }
-            if !domain.change_status(&moving, HumanStatus::Started, bulk)? {
+            let policy = super::start_policy(model);
+            if !super::status_op(domain, &moving, HumanStatus::Started, bulk, policy)? {
                 return Ok(IntentOutcome::None);
             }
         }
@@ -3160,7 +3201,13 @@ fn apply_board_intent(
             }
             model.clear_marks();
             note_skipped_done(model, skipped_done);
-            domain.change_status(&targets, HumanStatus::Ready, bulk)?;
+            super::status_op(
+                domain,
+                &targets,
+                HumanStatus::Ready,
+                bulk,
+                PrerequisitePolicy::NotApplicable,
+            )?;
         }
         BoardIntent::ToggleReview => {
             model.close_popup();
@@ -3190,7 +3237,13 @@ fn apply_board_intent(
             }
             model.clear_marks();
             note_skipped_done(model, skipped_done);
-            domain.change_status(&targets, HumanStatus::Ready, bulk)?;
+            super::status_op(
+                domain,
+                &targets,
+                HumanStatus::Ready,
+                bulk,
+                PrerequisitePolicy::NotApplicable,
+            )?;
         }
         BoardIntent::StageRight => {
             stage_right(domain, model);
@@ -3762,7 +3815,12 @@ fn apply_board_intent(
                 model.set_message(NO_SELECTION);
                 return Ok(IntentOutcome::None);
             }
-            if !domain.change_status(&targets, status, bulk)? {
+            let policy = if status == HumanStatus::Started {
+                super::start_policy(model)
+            } else {
+                PrerequisitePolicy::NotApplicable
+            };
+            if !super::status_op(domain, &targets, status, bulk, policy)? {
                 model.close_popup();
                 return Ok(IntentOutcome::None);
             }
@@ -3783,11 +3841,13 @@ fn apply_board_intent(
             }) {
                 return Ok(IntentOutcome::None);
             }
-            if bulk {
-                domain.complete_batch(&targets)?;
-            } else {
-                domain.complete(targets[0])?;
-            }
+            super::status_op(
+                domain,
+                &targets,
+                HumanStatus::Done,
+                bulk,
+                PrerequisitePolicy::NotApplicable,
+            )?;
         }
         BoardIntent::Reopen => {
             model.close_popup();
@@ -3796,7 +3856,8 @@ fn apply_board_intent(
                 model.set_message(NO_SELECTION);
                 return Ok(IntentOutcome::None);
             }
-            if !domain.change_status(&targets, HumanStatus::Open, bulk)? {
+            let policy = PrerequisitePolicy::NotApplicable;
+            if !super::status_op(domain, &targets, HumanStatus::Open, bulk, policy)? {
                 return Ok(IntentOutcome::None);
             }
         }
@@ -3896,11 +3957,19 @@ fn apply_board_intent(
                     // A ready task the delete leaves waiting on nothing stays ready: say so.
                     let unwaited = domain.unwaited_by_delete(&targets);
                     if bulk {
-                        domain.soft_delete_batch(&targets)?;
+                        let intent = Intent::SoftDelete {
+                            tasks: targets.clone(),
+                            marked: true,
+                        };
+                        super::apply_op(domain, intent)?;
                         model.arm_bulk_delete_notice(targets.len());
                     } else {
                         let id = targets[0];
-                        domain.soft_delete(id)?;
+                        let intent = Intent::SoftDelete {
+                            tasks: vec![id],
+                            marked: false,
+                        };
+                        super::apply_op(domain, intent)?;
                         if let Some((label, title)) = named {
                             model.arm_delete_notice(label.as_deref(), &title);
                         }
@@ -3954,7 +4023,7 @@ fn apply_board_intent(
                 return Ok(IntentOutcome::None);
             };
             let scope_path = path.to_string_lossy().into_owned();
-            domain.unarchive_project(&scope_path)?;
+            project_archived(domain, &scope_path, false)?;
             // A failed save lands in Save Recovery via the existing boundary; the session
             // default stays the project until the durable write lands.
             model.launch_card = None;
@@ -3997,8 +4066,10 @@ fn apply_board_intent(
                 let previous_visible = model.visible_ids();
                 let previous = model.selection_id;
                 let result = match tab {
-                    PickerTab::Main => domain.archive_project(&scope_path),
-                    PickerTab::Archived => domain.unarchive_project(&scope_path).map(|_| true),
+                    PickerTab::Main => project_archived(domain, &scope_path, true),
+                    PickerTab::Archived => {
+                        project_archived(domain, &scope_path, false).map(|_| true)
+                    }
                 };
                 if let Err(error) = result {
                     // Unknown project and friends leave the picker untouched and paint
@@ -4023,7 +4094,11 @@ fn apply_board_intent(
                 model.set_message(NO_SELECTION);
                 return Ok(IntentOutcome::None);
             }
-            if !domain.file_tasks(&targets, bulk)? {
+            let intent = Intent::ToggleArchived {
+                tasks: targets.clone(),
+                marked: bulk,
+            };
+            if !super::apply_op(domain, intent)? {
                 return Ok(IntentOutcome::None);
             }
             // Success has no message: disappearing rows are the feedback.
@@ -4042,7 +4117,7 @@ fn apply_board_intent(
                     return Ok(IntentOutcome::None);
                 };
                 let scope_path = path.to_string_lossy().into_owned();
-                if domain.unarchive_project(&scope_path).is_err() {
+                if project_archived(domain, &scope_path, false).is_err() {
                     return Ok(IntentOutcome::None);
                 }
                 model.sync_from_domain(domain);
@@ -4053,7 +4128,7 @@ fn apply_board_intent(
             // place and the focus becomes a normal project focus.
             if let Some(path) = model.archived_focus().map(std::path::Path::to_path_buf) {
                 let scope_path = path.to_string_lossy().into_owned();
-                if domain.unarchive_project(&scope_path).is_err() {
+                if project_archived(domain, &scope_path, false).is_err() {
                     return Ok(IntentOutcome::None);
                 }
                 model.sync_from_domain(domain);
@@ -4073,7 +4148,11 @@ fn apply_board_intent(
                 });
             if let Some(id) = model.selected_id().filter(|_| !archive_on_top) {
                 if domain.get(id).is_some_and(|task| task.archived) {
-                    domain.unarchive_task(id)?;
+                    let intent = Intent::SetArchived {
+                        task: id,
+                        archived: false,
+                    };
+                    super::apply_op(domain, intent)?;
                     let name = task_names(domain, &[id]);
                     model.sync_from_domain(domain);
                     model.set_message(format!("{name} unarchived"));
@@ -4085,7 +4164,7 @@ fn apply_board_intent(
                 return Ok(IntentOutcome::None);
             };
             let note = UndoNote::read(domain, &entry);
-            if let Err(error) = domain.undo() {
+            if let Err(error) = super::apply_op(domain, Intent::Undo) {
                 if let DomainError::StaleUndo(id) = error {
                     model.sync_from_domain(domain);
                     // Nothing moved, so this reports nothing to persist -- which is what
@@ -4478,9 +4557,10 @@ fn quick_add_save(
         lifted.assignee,
         lifted.base,
         lifted.due,
+        &lifted.after,
+        &[],
     ) {
         Ok(id) => {
-            domain.set_after_on_create(id, &lifted.after)?;
             // Do not discard the draft until the app save boundary confirms persistence. A
             // failed save keeps this exact state behind SaveRecovery for retry or cancel.
             model.form = None;
@@ -4570,7 +4650,8 @@ fn remove_assignee_name(domain: &mut DomainState, model: &mut BoardModel) -> Int
         });
         return IntentOutcome::None;
     };
-    if !domain.hide_assignee(&name) {
+    let intent = Intent::HideAssignee { name: name.clone() };
+    if !matches!(super::apply_op(domain, intent), Ok(true)) {
         return IntentOutcome::None;
     }
     model.sync_from_domain(domain);
@@ -4596,7 +4677,7 @@ fn undo_assignee_name(
         return Ok(IntentOutcome::None);
     };
     let note = UndoNote::read(domain, &entry);
-    domain.undo()?;
+    super::apply_op(domain, Intent::Undo)?;
     model.sync_from_domain(domain);
     model.refresh_assignee_picker();
     if let Some(note) = note {
@@ -4684,12 +4765,22 @@ fn confirm_on_picker(
         model.set_message("that block or review changed elsewhere");
         return Ok(IntentOutcome::None);
     }
-    let changes: Vec<(Uuid, crate::domain::BlockOn)> = target
+    let changes = target
         .records
         .iter()
-        .map(|(id, _, _)| (*id, on.clone()))
+        .map(|(id, key, _)| crate::domain::WaitingOnChange {
+            task: *id,
+            record: key.clone(),
+            on: on.clone(),
+        })
         .collect();
-    let changed = domain.set_on_batch(&changes)?;
+    let change = crate::domain::RoundIntent::SetOn { changes };
+    let changed = super::apply_op(
+        domain,
+        Intent::Round {
+            change: Box::new(change),
+        },
+    )?;
     model.clear_marks();
     if !changed {
         return Ok(IntentOutcome::None);
@@ -4839,23 +4930,38 @@ fn confirm_edit(
         .unwrap_or_default();
     let extra_after = extra_step.and_then(|(_, insert_after)| insert_after);
     // Only the steps part of the save is undoable.
-    domain.with_steps_undo(id, |domain| {
-        domain.edit_with_step_changes_and_base(
-            id,
-            &title,
-            notes.clone(),
-            scope.clone(),
-            thread.clone(),
-            assignee.clone(),
-            base.clone(),
-            &step_rename_list,
-            &step_removals.iter().copied().collect::<Vec<_>>(),
-            &extra_steps,
-            extra_after,
-        )?;
-        domain.stage_after_in_edit(id, &after)?;
-        domain.stage_due_in_edit(id, due.clone())
-    })?;
+    let field = |value: Option<String>| value.map_or(Field::Clear, Field::Set);
+    let patch = TaskPatch {
+        title: Some(title.clone()),
+        notes: Some(NotesEdit::Replace(field(notes.clone()))),
+        scope: Some(scope.clone()),
+        thread: Some(field(thread.clone())),
+        assignee: Some(assignee.clone().map_or(Field::Clear, Field::Set)),
+        base: Some(field(base.clone())),
+        due: Some(field(due.clone())),
+        after: (after != task.after)
+            .then(|| super::after_ids(domain, &after))
+            .transpose()?,
+        board_steps: Some(FormSteps {
+            renames: step_rename_list,
+            removals: step_removals.iter().copied().collect(),
+            additions: extra_steps
+                .into_iter()
+                .map(|text| NewStep {
+                    id: Uuid::new_v4(),
+                    text,
+                })
+                .collect(),
+            after: extra_after,
+        }),
+    };
+    super::apply_op(
+        domain,
+        Intent::EditTask {
+            task: id,
+            patch: Box::new(patch),
+        },
+    )?;
 
     // Retain the complete form and mode until the persistence boundary confirms this exact
     // task-session save. A failed save can then Retry or Cancel without orphaning drafts.
@@ -5257,7 +5363,7 @@ fn page_step_delete(
         model.set_message("press ctrl+x again to remove");
         return Ok(PageStepDelete::Marked);
     }
-    domain.with_steps_undo(task_id, |domain| domain.remove_step(task_id, step_id))?;
+    super::step_op(domain, task_id, StepChange::Remove { step: step_id })?;
     let len = domain
         .get(task_id)
         .map(|task| task.steps.len())
@@ -5496,31 +5602,33 @@ fn confirm_step_editor(
         editor.rename.is_none(),
         "existing-step drafts are staged by the task session"
     );
-    let index = editor
+    let anchor = editor
         .insert_after
-        .and_then(|anchor| {
+        .filter(|anchor| {
             domain
-                .get(task_id)?
-                .steps
-                .iter()
-                .position(|step| step.id == anchor)
+                .get(task_id)
+                .is_some_and(|task| task.steps.iter().any(|step| step.id == *anchor))
         })
-        .map_or(usize::MAX, |anchor| anchor + 1);
-    let touched =
-        match domain.with_steps_undo(task_id, |domain| domain.insert_step(task_id, &text, index)) {
-            Ok(step) => step,
-            Err(DomainError::EmptyStepText) => {
-                if let Some(editor) = model
-                    .form
-                    .as_mut()
-                    .and_then(|form| form.steps.editor.as_mut())
-                {
-                    editor.refusal = Some(STEP_TEXT_REQUIRED.to_string());
-                }
-                return Ok(IntentOutcome::None);
+        .map_or(StepAnchor::End, StepAnchor::After);
+    let step = NewStep {
+        id: Uuid::new_v4(),
+        text: text.clone(),
+    };
+    let id = step.id;
+    let touched = match super::step_op(domain, task_id, StepChange::Insert { step, anchor }) {
+        Ok(_) => id,
+        Err(DomainError::EmptyStepText) => {
+            if let Some(editor) = model
+                .form
+                .as_mut()
+                .and_then(|form| form.steps.editor.as_mut())
+            {
+                editor.refusal = Some(STEP_TEXT_REQUIRED.to_string());
             }
-            Err(other) => return Err(other),
-        };
+            return Ok(IntentOutcome::None);
+        }
+        Err(other) => return Err(other),
+    };
     let form = model.form.as_mut().expect("task form checked above");
     form.steps.pending_save = Some(StepEditorSave {
         step: touched,

@@ -2331,9 +2331,8 @@ pub fn offer_cleanup_prompt_with_host(
     if !preview.inspection.worktree_exists {
         let workspace = dispatch::untouched_workspace(host_kind, &preview.inspection);
         let close_workspace = host_kind.is_hosted() && preview.inspection.workspace_exists;
-        domain
-            .record_dispatch_cleaned(id, crate::domain::CleanupOutcome::Missing)
-            .and_then(|()| domain.complete_after_cleanup(id))
+        let missing = [(id, preview.record.clone())];
+        complete_after_cleanup_op(domain, &[id], &missing, false)
             .map_err(|error| CleanupError::Store(error.to_string()))?;
         let result = CleanupResult {
             remote: None,
@@ -2602,10 +2601,12 @@ pub fn offer_bulk_cleanup_prompt_with_host(
     }
     if rows.is_empty() && bulk.refused.is_empty() {
         let missing = bulk.missing.len();
-        for (id, _, _) in &bulk.missing {
-            domain.record_dispatch_cleaned(*id, crate::domain::CleanupOutcome::Missing)?;
-        }
-        domain.complete_batch_after_cleanup(&targets)?;
+        let markers: Vec<_> = bulk
+            .missing
+            .iter()
+            .map(|(id, _, record)| (*id, record.clone()))
+            .collect();
+        complete_after_cleanup_op(domain, &targets, &markers, true)?;
         model.clear_marks();
         return Ok(BulkCleanupOffer::MissingConverged {
             done: targets.len(),
@@ -2721,6 +2722,7 @@ pub fn confirm_cleanup_with_host(
         });
     }
     let mut missing = 0;
+    let mut markers = Vec::new();
     let mut workspaces = Vec::new();
     if let Some(bulk) = &prompt.bulk {
         for (id, identifier, inspected) in &bulk.missing {
@@ -2739,7 +2741,7 @@ pub fn confirm_cleanup_with_host(
                 None
             };
             if let Some(preview) = still_missing {
-                domain.record_dispatch_cleaned(*id, crate::domain::CleanupOutcome::Missing)?;
+                markers.push((*id, inspected.clone()));
                 missing += 1;
                 // `n` keeps what the dispatch left, its workspace included.
                 if clean && host_kind.is_hosted() && preview.inspection.workspace_exists {
@@ -2756,11 +2758,9 @@ pub fn confirm_cleanup_with_host(
                 .is_some_and(|task| task.status != HumanStatus::Done)
         })
         .count();
+    complete_after_cleanup_op(domain, &targets, &markers, prompt.bulk.is_some())?;
     if prompt.bulk.is_some() {
-        domain.complete_batch_after_cleanup(&targets)?;
         model.clear_marks();
-    } else {
-        domain.complete_after_cleanup(targets[0])?;
     }
     if !clean {
         model.close_popup();
@@ -3200,14 +3200,21 @@ pub fn poll_cleanup_runs(
                             if dispatch_unchanged(domain, row.task_id, row.inspected.as_ref()) {
                                 // The pre-mutation state, for save recovery.
                                 baseline.get_or_insert_with(|| domain.clone());
-                                if domain
-                                    .record_dispatch_cleaned_keeping_undo(
-                                        row.task_id,
-                                        result.outcome(),
-                                    )
-                                    .is_ok()
-                                {
-                                    mutated = true;
+                                if let Some(inspected) = row.inspected.clone() {
+                                    let change = crate::domain::DispatchIntent::RecordCleanup {
+                                        task: row.task_id,
+                                        cleanup: crate::domain::CleanupMarker {
+                                            expected_dispatch: Box::new(inspected),
+                                            outcome: result.outcome(),
+                                        },
+                                        keep_undo: true,
+                                    };
+                                    let intent = crate::domain::Intent::Dispatch {
+                                        change: Box::new(change),
+                                    };
+                                    if crate::ui::board::apply_op(domain, intent) == Ok(true) {
+                                        mutated = true;
+                                    }
                                 }
                             }
                             let worktree_gone = result.worktree == WorktreeCleanup::Missing;
@@ -3391,14 +3398,8 @@ fn run_board_dispatch(
             return;
         }
     };
-    let previous = domain.get(target).map(|task| task.status);
-    match dispatch::run_with_host(domain, target, &profiles, again, host_kind, host) {
+    match dispatch::run_with_host_start_undo(domain, target, &profiles, again, host_kind, host) {
         Ok(result) => {
-            if let Some(previous) = previous.filter(|status| *status != HumanStatus::Started) {
-                if let Err(error) = domain.push_start_undo(target, previous) {
-                    model.set_message(error.to_string());
-                }
-            }
             if let Err(error) = store.reload_merge_save(domain) {
                 fail_board_save(domain, model, save_recovery, baseline, error.to_string());
                 return;
@@ -3656,6 +3657,43 @@ fn ask_before_starting_waiting(
 
 /// The status row when a refresh before a start dropped or moved its target.
 const START_TARGET_CHANGED: &str = "that task changed elsewhere · nothing started";
+
+/// Complete `targets` after cleanup as one op, first marking each `missing` dispatch cleaned
+/// when it is still the task's dispatch. A marked set is one batch undo.
+fn complete_after_cleanup_op(
+    domain: &mut DomainState,
+    targets: &[uuid::Uuid],
+    missing: &[(uuid::Uuid, crate::domain::Dispatch)],
+    marked: bool,
+) -> Result<(), DomainError> {
+    use crate::domain::{CleanupCompletion, CleanupMarker, CleanupOutcome, DispatchIntent, Intent};
+    let targets = targets
+        .iter()
+        .map(|id| {
+            let from = domain.get(*id).ok_or(DomainError::UnknownId(*id))?.status;
+            let cleanup = missing
+                .iter()
+                .find(|(task, _)| task == id)
+                .map(|(_, record)| CleanupMarker {
+                    expected_dispatch: Box::new(record.clone()),
+                    outcome: CleanupOutcome::Missing,
+                });
+            Ok(CleanupCompletion {
+                task: *id,
+                from,
+                cleanup,
+            })
+        })
+        .collect::<Result<Vec<_>, DomainError>>()?;
+    let change = DispatchIntent::CompleteAfterCleanup { targets, marked };
+    crate::ui::board::apply_op(
+        domain,
+        Intent::Dispatch {
+            change: Box::new(change),
+        },
+    )?;
+    Ok(())
+}
 
 /// Ask before relaunching `target`'s gone agent: `y` relaunches, `n` only starts.
 fn open_relaunch_card(
@@ -4034,10 +4072,12 @@ fn start_plain_and_save(
         });
     }
     let closing = closing_candidates(domain, moving.iter().copied());
+    let policy = crate::ui::board::start_policy(model);
     let started = if bulk_card {
-        domain.start_batch(&moving)
+        crate::ui::board::start_batch_op(domain, &moving, policy)
     } else {
-        domain.change_status(&moving, HumanStatus::Started, moving.len() > 1)
+        let bulk = moving.len() > 1;
+        crate::ui::board::status_op(domain, &moving, HumanStatus::Started, bulk, policy)
     };
     if let Err(error) = started {
         model.set_message(board_rejection_message(&error));
@@ -20904,6 +20944,35 @@ mod quick_assign_tests {
             HumanStatus::Started
         );
         assert!(!model.start_anyway, "the pass is one start only");
+    }
+
+    /// The board's start checks prerequisites in the op itself, not only in the card that
+    /// asks first: a start that reaches the reducer unasked refuses, and start-anyway passes.
+    #[test]
+    fn a_board_start_that_skipped_the_card_still_refuses_a_waiting_task() {
+        let temp = Temp::new("after-gate", &["builder"]);
+        let (mut domain, mut model, ids) = board(&temp, &["first", "second"]);
+        link(
+            &temp,
+            &mut domain,
+            &mut model,
+            ids[1],
+            &[ids[0]],
+            HumanStatus::Ready,
+        );
+        select(&mut domain, &mut model, ids[1]);
+        let refused =
+            crate::ui::board::apply_intent(&mut domain, &mut model, BoardIntent::PrimaryVerb, None);
+        assert!(
+            matches!(&refused, Err(crate::domain::DomainError::Refused(reason)) if reason.contains("waits on")),
+            "{refused:?}"
+        );
+        assert_eq!(status_of(&domain, ids[1]), HumanStatus::Ready);
+        model.start_anyway = true;
+        let started =
+            crate::ui::board::apply_intent(&mut domain, &mut model, BoardIntent::PrimaryVerb, None);
+        assert_eq!(started, Ok(IntentOutcome::Persist));
+        assert_eq!(status_of(&domain, ids[1]), HumanStatus::Started);
     }
 
     #[test]

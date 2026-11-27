@@ -43,9 +43,25 @@ changes share one op, so its events share one time.
   task's latest status change, even after other edits. If a later status change
   made it stale, a successful launch still records its dispatch, unattributed.
 - `trash restore` stays a store operation (see above).
-- The board's marked-set dispatch still calls `commit_launch_with_status`
-  directly: it records on a task deleted mid-launch, which `RecordDispatch`
-  refuses. Board routing decides that case.
+
+### Board routing
+
+Every board mutation applies one `Op::local` by `you` through
+`ui::board::apply_op`. An op refusal outside the domain rules reaches the board
+as `DomainError::Refused` with the op's reason.
+
+- A marked status verb is one `StatusBatch`; one task is a `SetStatus` with
+  undo. The start card's marked set is a `StartBatch` of start entries.
+- Starts carry `Check`, or `Override` once the start-anyway card said yes.
+- Creates (expanded capture and quick add) are one `Create`, with `after` and
+  the drafted steps. The task-page form is one `EditTask` with `board_steps`.
+- The reply box is one `Transaction`: `Guard`, the reply, then `SetStatus`.
+- Block and review cards open rounds only on live targets; a task deleted
+  since the card opened is left out.
+- A single dispatch that starts the task carries its status undo in
+  `RecordDispatch`. A marked-set launch whose task was deleted meanwhile
+  records without a start: `RecordDispatch` with no start accepts a deleted
+  task, so a restore brings the record back.
 
 ## Tasks and lifecycle
 
@@ -55,7 +71,7 @@ changes share one op, so its events share one time.
 | `EditTask(task, field patch, step intents)` | CLI edit: `edit_with_assignee_and_base`, `edit_due`, `edit_after`, `set_on`; board form: `edit_with_step_changes_and_base`, staged due and after | Scalar fields use last arrival, including an explicit board scope patch (desk or project UUID). CLI edit keeps scope. Only staged step changes get board form undo. Keep CLI edits atomic and preserve `SetOn` undo as described below. |
 | `SetAssignee`, `SetBase`, `SetDue` (task, value or clear) | Board actions and CLI edit; `assign_batch`, `set_base_batch`, `edit_due` | Scalar last arrival with history. Marked actions keep a single batch undo. Any automatic unhide on assignment stays in the same change. |
 | `SetAfter(task, prerequisite IDs)`, `ChainAfter(ordered task IDs)` | CLI edit and create; board after picker and chain; `set_after_batch`, `chain_after` | Validate existence, self-links and cycles against current state. Create and edits cannot add an already-done prerequisite, but edits can retain a done link already present. The picker replaces prerequisites; chain appends each missing predecessor. Both board actions have one atomic undo; CLI `edit --after` adds none. Local code still resolves numbers until T7. |
-| `SetStatus(task, from, to)`, `Complete(task, from)` | CLI status, board status/start/done paths; `set_status_by`, `change_status`, `start_batch`, `complete`, `complete_batch` | Flag a stale `from`; preserve close-record effects. Done and its releases share a save. Board status adds undo, and board completion undo includes release effects. CLI ordinary status and done via `set_status_by` add no undo. |
+| `SetStatus(task, from, to)`, `Complete(task, from)`, `StartBatch(tasks)` | CLI status, board status/start/done paths; `set_status_by`, `change_status`, `start_batch`, `complete`, `complete_batch` | Flag a stale `from`; preserve close-record effects. Done and its releases share a save. Board status adds undo, and board completion undo includes release effects. CLI ordinary status and done via `set_status_by` add no undo. |
 | `SoftDelete(task)`, `Restore(task)` | Board delete and undo; `soft_delete`, `soft_delete_batch`, `restore` | Tombstone by ID. Clearing prerequisites that point to deleted tasks belongs to that same delete and undo. |
 | `SetArchived(task, archived)`, `ToggleArchived(task)` | CLI archive/unarchive; board `file_tasks`, `unarchive_task` | Keep archive separate from status. Board toggle has single/batch undo. CLI explicit archive/unarchive is idempotent and has no undo. On an archived task with no live archive entry on top, board `ctrl+u` explicitly unarchives without pushing or popping undo. |
 | `RestoreTrash(task)` | CLI trash restore via `TaskStore::restore_from_trash` and `insert_restored` | Resolve the tombstone by ID; the store/authority decides whether a display number is still free. Reject an already-live ID. No undo is added. |

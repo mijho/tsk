@@ -431,6 +431,9 @@ pub enum DomainError {
     StaleProjectUndo(String),
     /// A due date that is not a real `YYYY-MM-DD` day.
     InvalidDue(super::DueError),
+    /// An op refused outside the domain rules: a stale round or dispatch, or an invalid
+    /// intent. Carries the op's reason.
+    Refused(String),
 }
 
 impl std::fmt::Display for DomainError {
@@ -472,6 +475,7 @@ impl std::fmt::Display for DomainError {
                 write!(f, "project {path} changed since the title change")
             }
             DomainError::InvalidDue(error) => write!(f, "{error}"),
+            DomainError::Refused(reason) => f.write_str(reason),
         }
     }
 }

@@ -7,8 +7,10 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::domain::{
-    Block, BlockDraft, BlockField, BlockKey, BlockKind, BlockOn, BlockPatch, CheckState,
-    DomainError, DomainState, HumanStatus, ReviewDraft, ReviewPatch, Task, BLOCK_TEXT_MAX, OWNER,
+    Block, BlockDraft, BlockField, BlockIntentPatch, BlockKey, BlockKind, BlockOn, CheckState,
+    DomainError, DomainState, HumanStatus, Intent, OpenRoundMode, OpenRoundTarget,
+    PrerequisitePolicy, ReplyKey, ReviewDraft, ReviewIntentPatch, RoundIntent, Task, TextPatch,
+    BLOCK_TEXT_MAX, OWNER,
 };
 use crate::ui::edit::{seeded_draft, EditBuffer};
 use crate::ui::mouse::BoardPopup;
@@ -548,23 +550,32 @@ pub(super) fn confirm_block_card(
                 return Ok(IntentOutcome::None);
             }
             // The card has no options field: edit why, on and needs only.
-            domain.edit_block(
-                id,
-                BlockPatch {
-                    why: Some(draft.why),
-                    needs: Some(draft.needs),
-                    options: None,
-                    on: Some(draft.on),
+            let patch = BlockIntentPatch {
+                why: replaced(draft.why),
+                needs: replaced(draft.needs),
+                options: None,
+                on: Some(draft.on),
+            };
+            let record = current.expect("checked above");
+            round(
+                domain,
+                RoundIntent::EditBlock {
+                    task: id,
+                    record,
+                    patch,
                 },
             )?
         }
         None => {
-            let live: Vec<Uuid> = targets
-                .iter()
-                .copied()
-                .filter(|id| domain.get(*id).is_some())
-                .collect();
-            domain.block_batch(&live, &draft, OWNER)?
+            let targets = open_targets(domain, &targets);
+            round(
+                domain,
+                RoundIntent::OpenBlock {
+                    targets,
+                    mode: OpenRoundMode::Board,
+                    draft,
+                },
+            )?
         }
     };
     if !changed {
@@ -633,15 +644,32 @@ fn confirm_review_card(
                 model.set_message("that review round was closed elsewhere");
                 return Ok(IntentOutcome::None);
             }
-            domain.edit_review(id, ReviewPatch::replace_with(draft))?
+            let patch = ReviewIntentPatch {
+                done: replaced(draft.done),
+                checks: Some(draft.checks.into_iter().map(|check| check.text).collect()),
+                next: replaced(draft.next),
+                on: Some(draft.on),
+            };
+            let record = current.expect("checked above");
+            round(
+                domain,
+                RoundIntent::EditReview {
+                    task: id,
+                    record,
+                    patch,
+                },
+            )?
         }
         None => {
-            let live: Vec<Uuid> = targets
-                .iter()
-                .copied()
-                .filter(|id| domain.get(*id).is_some())
-                .collect();
-            domain.review_batch(&live, &draft, OWNER)?
+            let targets = open_targets(domain, &targets);
+            round(
+                domain,
+                RoundIntent::OpenReview {
+                    targets,
+                    mode: OpenRoundMode::Board,
+                    draft,
+                },
+            )?
         }
     };
     if !changed {
@@ -1186,14 +1214,31 @@ pub(super) fn cycle_selected_check(
         return Ok(IntentOutcome::None);
     };
     freeze_check_fold(model);
-    match domain.set_check(id, index, state) {
-        Ok(true) => {}
-        Ok(false) => return Ok(IntentOutcome::None),
-        Err(DomainError::NotInReview(_) | DomainError::UnknownCheck(_)) => {
-            model.set_message("this review changed elsewhere");
-            return Ok(IntentOutcome::None);
-        }
-        Err(error) => return Err(error),
+    // Address the check in the stored round by its text and occurrence of that text.
+    let change = domain
+        .get(id)
+        .and_then(|task| task.block.as_ref())
+        .filter(|block| block.is_review())
+        .and_then(|block| {
+            let check = block.checks.get(index)?;
+            let occurrence = block.checks[..index]
+                .iter()
+                .filter(|other| other.text == check.text)
+                .count();
+            Some(RoundIntent::SetCheck {
+                task: id,
+                record: block.key(),
+                check: check.text.clone(),
+                occurrence,
+                state,
+            })
+        });
+    let Some(change) = change else {
+        model.set_message("this review changed elsewhere");
+        return Ok(IntentOutcome::None);
+    };
+    if !round(domain, change)? {
+        return Ok(IntentOutcome::None);
     }
     Ok(IntentOutcome::Persist)
 }
@@ -1293,7 +1338,24 @@ pub(super) fn delete_selected_reply(
     let Some(id) = model.form.as_ref().and_then(|form| form.task_id()) else {
         return Ok(IntentOutcome::None);
     };
-    domain.delete_reply(id, index)?;
+    let block = domain
+        .get(id)
+        .and_then(|task| task.block.as_ref())
+        .ok_or(DomainError::NotBlocked(id))?;
+    let reply = block
+        .replies
+        .get(index)
+        .map(ReplyKey::of)
+        .ok_or(DomainError::UnknownReply(index))?;
+    let record = block.key();
+    round(
+        domain,
+        RoundIntent::DeleteReply {
+            task: id,
+            record,
+            reply,
+        },
+    )?;
     // The stub is not a ring stop: the heading keeps the cursor on the section.
     if let Some(form) = model.form.as_mut() {
         form.block.target = Some(BlockTarget::Heading);
@@ -1362,25 +1424,60 @@ pub(super) fn save_reply(
             status
         }
     });
-    // The reply lands on the open block before the unblock closes it, as one change.
-    let stored = domain.as_one_change(id, |domain| {
-        let index = match edit {
-            _ if unblock_only => None,
-            Some(index) => Some(domain.edit_reply(id, index, &text).map(|()| index)?),
-            None => Some(domain.reply(id, &text, OWNER)?),
-        };
-        if let Some(status) = unblock {
-            domain.change_status(&[id], status, false)?;
+    // The reply lands on the open block before the unblock closes it, as one change: the
+    // exact round, the reply, then the status (only the status is undoable).
+    let wrap = |change| Intent::Round {
+        change: Box::new(change),
+    };
+    let mut intents = vec![wrap(RoundIntent::Guard {
+        task: id,
+        record: opened_on.clone(),
+        require_failed_check: unblock_only && editor_review,
+    })];
+    let block = domain
+        .get(id)
+        .and_then(|task| task.block.as_ref())
+        .expect("the open block was checked above");
+    let index = match edit {
+        _ if unblock_only => None,
+        Some(index) => {
+            let Some(reply) = block.replies.get(index).map(ReplyKey::of) else {
+                return refuse(model, "this block changed elsewhere".to_string());
+            };
+            intents.push(wrap(RoundIntent::EditReply {
+                task: id,
+                record: opened_on.clone(),
+                reply,
+                text: text.clone(),
+            }));
+            Some(index)
         }
-        Ok(index)
-    });
-    let index = match stored {
-        Ok(index) => index,
+        None => {
+            intents.push(wrap(RoundIntent::AddReply {
+                task: id,
+                record: opened_on.clone(),
+                text: text.clone(),
+            }));
+            Some(block.replies.len())
+        }
+    };
+    if let Some(status) = unblock {
+        let from = domain.get(id).expect("checked above").status;
+        intents.push(Intent::SetStatus {
+            task: id,
+            from,
+            to: status,
+            prerequisite_policy: PrerequisitePolicy::NotApplicable,
+            undo: true,
+        });
+    }
+    match super::apply_op(domain, Intent::Transaction { intents }) {
+        Ok(_) => {}
         Err(DomainError::NotBlocked(_) | DomainError::UnknownReply(_)) => {
             return refuse(model, "this block changed elsewhere".to_string());
         }
         Err(error) => return Err(error),
-    };
+    }
     if let Some(editor) = active_reply_mut(model) {
         editor.refusal = None;
         editor.pending = Some(ReplySave {
@@ -1498,4 +1595,34 @@ pub(super) fn reply_buffer_mut(model: &mut BoardModel) -> Option<&mut EditBuffer
         editor.refusal = None;
     }
     Some(&mut editor.buffer)
+}
+
+/// A replaced card field: its validated text, or a clear when it trims away.
+fn replaced(value: Option<String>) -> TextPatch {
+    value.map_or(TextPatch::Clear, TextPatch::Set)
+}
+
+/// The live targets of a card that opens a round, each with the status and open record the
+/// board sees. A task deleted meanwhile is left out.
+fn open_targets(domain: &DomainState, targets: &[Uuid]) -> Vec<OpenRoundTarget> {
+    targets
+        .iter()
+        .filter_map(|id| domain.get(*id))
+        .filter(|task| !task.soft_deleted)
+        .map(|task| OpenRoundTarget {
+            task: task.id,
+            from: task.status,
+            expected_record: task.block.as_ref().map(Block::key),
+        })
+        .collect()
+}
+
+/// Apply one round intent as a board op.
+fn round(domain: &mut DomainState, change: RoundIntent) -> Result<bool, DomainError> {
+    super::apply_op(
+        domain,
+        Intent::Round {
+            change: Box::new(change),
+        },
+    )
 }

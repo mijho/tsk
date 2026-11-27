@@ -114,7 +114,12 @@ impl DispatchIntent {
                 record,
                 start,
             } => {
-                let target = live(state, *task)?;
+                // An agent that launched while its task was deleted still lands its record,
+                // without a status change, so a restore brings both back.
+                let target = match start {
+                    Some(_) => live(state, *task)?,
+                    None => state.get(*task).ok_or(DomainError::UnknownId(*task))?,
+                };
                 if !expected.matches(target) {
                     return Err(ApplyError::StaleDispatch(*task));
                 }
@@ -587,5 +592,33 @@ mod tests {
                 assert_eq!(detail.after, Some(number));
             }
         }
+    }
+
+    /// An agent that launched while its task was deleted lands its record without a start;
+    /// a start on a deleted task still refuses.
+    #[test]
+    fn a_dispatch_without_a_start_lands_on_a_deleted_task() {
+        let mut state = DomainState::new();
+        let id = task(&mut state, "deleted mid-launch");
+        state.soft_delete(id).unwrap();
+        let record = |start| DispatchIntent::RecordDispatch {
+            task: id,
+            expected: DispatchGuard::Dispatch { expected: None },
+            record: Box::new(dispatch("late")),
+            start,
+        };
+        let start = DispatchStart {
+            from: HumanStatus::Open,
+            prerequisite_policy: PrerequisitePolicy::NotApplicable,
+            undo: false,
+        };
+        assert_eq!(
+            record(Some(start)).apply(&mut state),
+            Err(DomainError::SoftDeleted(id).into())
+        );
+        assert!(record(None).apply(&mut state).unwrap().changed);
+        let task = state.get(id).unwrap();
+        assert!(task.soft_deleted && task.dispatch.is_some());
+        assert_eq!(task.status, HumanStatus::Open);
     }
 }
