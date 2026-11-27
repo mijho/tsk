@@ -52,7 +52,10 @@ as `DomainError::Refused` with the op's reason.
 
 - A marked status verb is one `StatusBatch`; one task is a `SetStatus` with
   undo. The start card's marked set is a `StartBatch` of start entries.
-- Starts carry `Check`, or `Override` once the start-anyway card said yes.
+- Board starts carry `NotApplicable`: the start-anyway card is the board's
+  prerequisite gate, asked before the op, and later cards (bulk dispatch,
+  relaunch `n`, reply box) never ask again. Wherever an op does carry `Check`,
+  only a task whose status moves is checked.
 - Creates (expanded capture and quick add) are one `Create`, with `after` and
   the drafted steps. The task-page form is one `EditTask` with `board_steps`.
 - The reply box is one `Transaction`: `Guard`, the reply, then `SetStatus`.

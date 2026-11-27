@@ -4072,7 +4072,8 @@ fn start_plain_and_save(
         });
     }
     let closing = closing_candidates(domain, moving.iter().copied());
-    let policy = crate::ui::board::start_policy(model);
+    // The start-anyway card already asked: the board's starts do not gate again.
+    let policy = crate::domain::PrerequisitePolicy::NotApplicable;
     let started = if bulk_card {
         crate::ui::board::start_batch_op(domain, &moving, policy)
     } else {
@@ -20946,12 +20947,48 @@ mod quick_assign_tests {
         assert!(!model.start_anyway, "the pass is one start only");
     }
 
-    /// The board's start checks prerequisites in the op itself, not only in the card that
-    /// asks first: a start that reaches the reducer unasked refuses, and start-anyway passes.
+    /// The start-anyway card is the board's prerequisite gate: a set-status start on a marked
+    /// set holding a started task that still waits starts the rest, and the same verb on that
+    /// task alone is a quiet no-op.
     #[test]
-    fn a_board_start_that_skipped_the_card_still_refuses_a_waiting_task() {
-        let temp = Temp::new("after-gate", &["builder"]);
-        let (mut domain, mut model, ids) = board(&temp, &["first", "second"]);
+    fn a_start_past_an_already_started_waiting_task_is_not_refused() {
+        let temp = Temp::new("after-started", &["builder"]);
+        let (mut domain, mut model, ids) = board(&temp, &["first", "second", "third"]);
+        link(
+            &temp,
+            &mut domain,
+            &mut model,
+            ids[1],
+            &[ids[0]],
+            HumanStatus::Started,
+        );
+        let start = BoardIntent::SetStatus(HumanStatus::Started);
+        select(&mut domain, &mut model, ids[1]);
+        let alone = crate::ui::board::apply_intent(&mut domain, &mut model, start.clone(), None);
+        assert_eq!(alone, Ok(IntentOutcome::None));
+        let apply = |domain: &mut DomainState, model: &mut BoardModel, intent| {
+            crate::ui::board::apply_intent(domain, model, intent, None).expect("intent")
+        };
+        apply(&mut domain, &mut model, BoardIntent::ToggleMarkMode);
+        apply(&mut domain, &mut model, BoardIntent::MarkToggle);
+        select(&mut domain, &mut model, ids[2]);
+        apply(&mut domain, &mut model, BoardIntent::MarkToggle);
+        assert_eq!(model.marked_count(), 2);
+        assert_eq!(
+            apply(&mut domain, &mut model, start),
+            IntentOutcome::Persist
+        );
+        assert_eq!(status_of(&domain, ids[2]), HumanStatus::Started);
+        assert_eq!(status_of(&domain, ids[1]), HumanStatus::Started);
+    }
+
+    /// Start anyway, then `n` on the relaunch card that follows: the start the card agreed to
+    /// lands, past the prerequisite the start-anyway card already asked about.
+    #[test]
+    fn start_anyway_then_start_without_relaunch_starts_the_waiting_task() {
+        let temp = Temp::new("after-relaunch-n", &["builder"]);
+        let (mut domain, mut model, ids) = board(&temp, &["first", "agent gone"]);
+        dispatched_before(&temp, &mut domain, &mut model, ids[1], HumanStatus::Ready);
         link(
             &temp,
             &mut domain,
@@ -20961,18 +20998,33 @@ mod quick_assign_tests {
             HumanStatus::Ready,
         );
         select(&mut domain, &mut model, ids[1]);
-        let refused =
-            crate::ui::board::apply_intent(&mut domain, &mut model, BoardIntent::PrimaryVerb, None);
-        assert!(
-            matches!(&refused, Err(crate::domain::DomainError::Refused(reason)) if reason.contains("waits on")),
-            "{refused:?}"
+        let mut host = fake_host(&temp);
+        host.agent = Some(false);
+        let start = BoardIntent::SetStatus(HumanStatus::Started);
+        handle(&temp, &mut domain, &mut model, start, &mut host);
+        assert!(model
+            .dispatch_prompt()
+            .is_some_and(|prompt| prompt.start_anyway.is_some()));
+        handle(
+            &temp,
+            &mut domain,
+            &mut model,
+            BoardIntent::ConfirmDispatch,
+            &mut host,
         );
-        assert_eq!(status_of(&domain, ids[1]), HumanStatus::Ready);
-        model.start_anyway = true;
-        let started =
-            crate::ui::board::apply_intent(&mut domain, &mut model, BoardIntent::PrimaryVerb, None);
-        assert_eq!(started, Ok(IntentOutcome::Persist));
-        assert_eq!(status_of(&domain, ids[1]), HumanStatus::Started);
+        assert!(model
+            .dispatch_prompt()
+            .is_some_and(|prompt| prompt.relaunch.is_some()));
+        handle(
+            &temp,
+            &mut domain,
+            &mut model,
+            BoardIntent::StartWithoutRelaunch,
+            &mut host,
+        );
+        assert_eq!(host.ran, 0, "nothing relaunched");
+        let disk = temp.store.load().expect("load");
+        assert_eq!(status_of(&disk, ids[1]), HumanStatus::Started);
     }
 
     #[test]

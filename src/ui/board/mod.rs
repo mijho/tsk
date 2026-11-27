@@ -108,15 +108,6 @@ pub(crate) fn start_batch_op(
     )
 }
 
-/// How a board start treats prerequisites: checked, unless the start-anyway card said yes.
-pub(crate) fn start_policy(model: &BoardModel) -> crate::domain::PrerequisitePolicy {
-    if model.start_anyway {
-        crate::domain::PrerequisitePolicy::Override
-    } else {
-        crate::domain::PrerequisitePolicy::Check
-    }
-}
-
 /// The task ids of prerequisite numbers, as an op carries them.
 pub(crate) fn after_ids(
     domain: &crate::domain::DomainState,

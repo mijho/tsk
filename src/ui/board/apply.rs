@@ -3167,7 +3167,7 @@ fn apply_board_intent(
                     moving.len()
                 ));
             }
-            let policy = super::start_policy(model);
+            let policy = PrerequisitePolicy::NotApplicable;
             if !super::status_op(domain, &moving, HumanStatus::Started, bulk, policy)? {
                 return Ok(IntentOutcome::None);
             }
@@ -3815,11 +3815,7 @@ fn apply_board_intent(
                 model.set_message(NO_SELECTION);
                 return Ok(IntentOutcome::None);
             }
-            let policy = if status == HumanStatus::Started {
-                super::start_policy(model)
-            } else {
-                PrerequisitePolicy::NotApplicable
-            };
+            let policy = PrerequisitePolicy::NotApplicable;
             if !super::status_op(domain, &targets, status, bulk, policy)? {
                 model.close_popup();
                 return Ok(IntentOutcome::None);

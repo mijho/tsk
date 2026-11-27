@@ -384,7 +384,10 @@ impl DomainState {
                         actual,
                     });
                 }
-                if *to == HumanStatus::Started && *prerequisite_policy == PrerequisitePolicy::Check
+                // Only a start that moves the status checks the prerequisites.
+                if actual != *to
+                    && *to == HumanStatus::Started
+                    && *prerequisite_policy == PrerequisitePolicy::Check
                 {
                     let prerequisites = self.waiting_on(target);
                     if !prerequisites.is_empty() {
@@ -555,7 +558,10 @@ impl DomainState {
                     actual: task.status,
                 });
             }
-            if to == HumanStatus::Started && prerequisite_policy == PrerequisitePolicy::Check {
+            if task.status != to
+                && to == HumanStatus::Started
+                && prerequisite_policy == PrerequisitePolicy::Check
+            {
                 let prerequisites = self.waiting_on(task);
                 if !prerequisites.is_empty() {
                     return Err(ApplyError::WaitingOn {
@@ -1314,5 +1320,49 @@ mod tests {
                     && entries.iter().all(|entry| matches!(entry, UndoEntry::Start { .. }))
         ));
         assert_eq!(state.get(second).unwrap().status, HumanStatus::Started);
+    }
+
+    /// The gate checks only a start that moves the status: an already-started task that still
+    /// waits is a no-op alone and does not refuse the batch it is in.
+    #[test]
+    fn the_start_gate_skips_tasks_already_started() {
+        let mut state = DomainState::new();
+        let make = |state: &mut DomainState, title| {
+            state
+                .create(
+                    title,
+                    None,
+                    TaskScope::Global,
+                    ProvenanceOrigin::Manual,
+                    None,
+                )
+                .unwrap()
+        };
+        let (first, waiting, other) = (
+            make(&mut state, "first"),
+            make(&mut state, "waiting"),
+            make(&mut state, "other"),
+        );
+        state.assign_numbers_for_persistence();
+        let number = state.get(first).unwrap().number.unwrap();
+        state.set_after(waiting, &[number]).unwrap();
+        state.set_status(waiting, HumanStatus::Started).unwrap();
+        let alone = Intent::SetStatus {
+            task: waiting,
+            from: HumanStatus::Started,
+            to: HumanStatus::Started,
+            prerequisite_policy: PrerequisitePolicy::Check,
+            undo: true,
+        };
+        assert!(!apply(&mut state, 2, alone).unwrap().changed);
+        let batch = Intent::StatusBatch {
+            tasks: [(waiting, HumanStatus::Started), (other, HumanStatus::Open)]
+                .map(|(task, from)| StatusSource { task, from })
+                .to_vec(),
+            to: HumanStatus::Started,
+            prerequisite_policy: PrerequisitePolicy::Check,
+        };
+        assert!(apply(&mut state, 3, batch).unwrap().changed);
+        assert_eq!(state.get(other).unwrap().status, HumanStatus::Started);
     }
 }
