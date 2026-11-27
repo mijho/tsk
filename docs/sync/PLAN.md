@@ -68,9 +68,9 @@ claim is refused. A stale claim is flagged, never auto-released (human status is
 | --- | --- | --- |
 | 0 | Ops locally: every mutation is an op; `after` by id (store migration) | Replay-from-empty equals final state, for every verb |
 | 1 | Server + online writes | Two clients on one workspace, CLI only |
-| 2 | Outbox, provisional numbers, rejected-op notices | Agent VM edits offline, reconnects, converges |
+| 2 | Outbox, provisional numbers, rejection notices, field merges and status-conflict flags, release, undo, host-tagged dispatch | Agent VM edits offline, reconnects, converges |
 | 3 | `/events`, board subscribes, read-only PWA | Phone sees an agent's status change within a second |
-| 4 | Claims, status-conflict flags | Two agents race one task; exactly one wins |
+| 4 | Claims and stale-claim flags | Two agents race one task; exactly one wins |
 | 5 | PWA writes: status verbs, reply, quick-add | Unblock an agent from the phone |
 
 Dogfood: after phase 2, this board moves onto the shared workspace.
