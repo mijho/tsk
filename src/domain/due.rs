@@ -4,10 +4,9 @@
 //! (`2026-08-08`). Only a date that exists is stored, so the text orders the same way the
 //! days do.
 
-use std::time::SystemTime;
-
 use uuid::Uuid;
 
+use super::events::mutation_time;
 use super::{record_event, DomainError, DomainState, EditedField, EventDetail, TaskEventKind};
 
 /// Why a due date was refused.
@@ -108,7 +107,7 @@ impl DomainState {
         record_event(
             task,
             TaskEventKind::Edited,
-            SystemTime::now(),
+            mutation_time(),
             None,
             due_detail(),
         );

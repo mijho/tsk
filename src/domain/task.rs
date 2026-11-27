@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::events::{mutation_id, mutation_time};
 use super::{
     block_text, current_actor, Block, BlockDraft, BlockField, BlockKey, BlockKind, BlockOn,
     BlockPatch, CheckState, CleanupOutcome, EditedField, EventDetail, ProvenanceOrigin, Reply,
@@ -552,7 +553,7 @@ fn reopen_last_record(task: &mut Task, previous: HumanStatus) {
 }
 
 fn record_mutation(task: &mut Task, kind: TaskEventKind) {
-    record_mutation_at(task, kind, SystemTime::now());
+    record_mutation_at(task, kind, mutation_time());
 }
 
 fn record_mutation_at(task: &mut Task, kind: TaskEventKind, at: SystemTime) {
@@ -568,7 +569,7 @@ pub(super) fn record_event(
     detail: Option<EventDetail>,
 ) {
     task.merge_base_revision = Some(task.revision);
-    task.revision = Uuid::new_v4();
+    task.revision = mutation_id();
     task.updated_at = at;
     task.history.push(event(kind, at, by, detail));
 }
@@ -1168,13 +1169,13 @@ impl DomainState {
             return Err(DomainError::EmptyTitle);
         }
 
-        let now = SystemTime::now();
-        let id = Uuid::new_v4();
+        let now = mutation_time();
+        let id = mutation_id();
         self.tasks.push(Task {
             id,
             number: None,
             notice: None,
-            revision: Uuid::new_v4(),
+            revision: mutation_id(),
             merge_base_revision: None,
             title: title.to_string(),
             notes,
@@ -1257,7 +1258,7 @@ impl DomainState {
         task.steps = steps
             .into_iter()
             .map(|(text, done)| Step {
-                id: Uuid::new_v4(),
+                id: mutation_id(),
                 text,
                 done,
             })
@@ -1289,7 +1290,7 @@ impl DomainState {
         if task.block.as_ref().is_some_and(|block| !block.is_review()) {
             return Err(DomainError::AlreadyBlocked(id));
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         close_record(task, at, by);
         let from = task.status;
         let (kind, detail) = if from == HumanStatus::Blocked {
@@ -1355,7 +1356,7 @@ impl DomainState {
         record_event(
             task,
             TaskEventKind::StatusSet,
-            SystemTime::now(),
+            mutation_time(),
             None,
             Some(EventDetail::status(from, previous)),
         );
@@ -1370,7 +1371,7 @@ impl DomainState {
         if task.block.as_ref().is_some_and(Block::is_review) {
             return Err(DomainError::AlreadyBlocked(id));
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         close_record(task, at, by);
         let from = task.status;
         let (kind, detail) = if from == HumanStatus::Review {
@@ -1454,7 +1455,7 @@ impl DomainState {
         if next == *block {
             return Ok(false);
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         next.edited_at = Some(at);
         *block = next;
         record_mutation_at(task, TaskEventKind::ReviewEdited, at);
@@ -1510,7 +1511,7 @@ impl DomainState {
         if next == *block {
             return Ok(false);
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         next.edited_at = Some(at);
         *block = next;
         record_mutation_at(task, TaskEventKind::BlockEdited, at);
@@ -1535,7 +1536,7 @@ impl DomainState {
                 return Err(DomainError::NotBlocked(*id));
             }
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         let mut entries = Vec::new();
         let mut seen = BTreeSet::new();
         for (id, on) in changes {
@@ -1582,7 +1583,7 @@ impl DomainState {
         record_event(
             task,
             TaskEventKind::OnSet,
-            SystemTime::now(),
+            mutation_time(),
             None,
             on_detail(&previous, &on),
         );
@@ -1596,7 +1597,7 @@ impl DomainState {
             .ok_or(DomainError::EmptyReply)?;
         let task = self.task_mut(id)?;
         let block = task.block.as_mut().ok_or(DomainError::NotBlocked(id))?;
-        let at = SystemTime::now();
+        let at = mutation_time();
         block.replies.push(Reply {
             by: by.to_string(),
             at,
@@ -1686,7 +1687,7 @@ impl DomainState {
         };
         reply.sent = true;
         task.merge_base_revision = Some(task.revision);
-        task.revision = Uuid::new_v4();
+        task.revision = mutation_id();
         let after = task.revision;
         for entry in &mut self.undo_stack {
             entry.retarget(id, before, after);
@@ -1744,7 +1745,7 @@ impl DomainState {
         if ids.is_empty() {
             return Ok(());
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         let mut entries = Vec::with_capacity(ids.len());
         for id in ids {
             let by = current_actor();
@@ -1807,7 +1808,7 @@ impl DomainState {
     pub fn soft_delete(&mut self, id: Uuid) -> Result<(), DomainError> {
         // One moment for the delete and the links it drops, so the unlinks never read as a
         // later undoable action that would send the deleted task to trash at once.
-        let at = SystemTime::now();
+        let at = mutation_time();
         let expected_revision = {
             let task = self.task_mut(id)?;
             task.soft_deleted = true;
@@ -1838,7 +1839,7 @@ impl DomainState {
         if ids.is_empty() {
             return Ok(());
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         let mut entries = Vec::with_capacity(ids.len());
         for id in ids.iter().copied() {
             let task = self.task_mut(id)?;
@@ -1966,7 +1967,7 @@ impl DomainState {
             // Nothing to reassign: only the name came back, and that alone is the undo.
             return Ok(shown.map(|entry| self.undo_stack.push(entry)).is_some());
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         let name = assignee.as_ref().map(|assignee| assignee.name.clone());
         let mut entries = Vec::with_capacity(changed.len());
         for id in changed {
@@ -2006,13 +2007,7 @@ impl DomainState {
         let task = self.task_mut(id)?;
         let detail = assigned_detail(&assignee);
         task.set_assigned(assignee.map(|name| Assignee { name, kind }));
-        record_event(
-            task,
-            TaskEventKind::Assigned,
-            SystemTime::now(),
-            None,
-            detail,
-        );
+        record_event(task, TaskEventKind::Assigned, mutation_time(), None, detail);
         Ok(())
     }
 
@@ -2035,7 +2030,7 @@ impl DomainState {
         if changed.is_empty() {
             return Ok(false);
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         let mut entries = Vec::with_capacity(changed.len());
         for id in changed {
             let task = self.task_mut(id)?;
@@ -2064,13 +2059,7 @@ impl DomainState {
         let task = self.task_mut(id)?;
         let detail = base_detail(&base);
         task.base = base;
-        record_event(
-            task,
-            TaskEventKind::BaseSet,
-            SystemTime::now(),
-            None,
-            detail,
-        );
+        record_event(task, TaskEventKind::BaseSet, mutation_time(), None, detail);
         Ok(())
     }
 
@@ -2177,7 +2166,7 @@ impl DomainState {
         let from = task.status;
         task.status = previous;
         reopen_last_record(task, previous);
-        let at = SystemTime::now();
+        let at = mutation_time();
         sync_block_with_status(task, at, &by);
         record_event(
             task,
@@ -2307,7 +2296,7 @@ impl DomainState {
         record_event(
             task,
             TaskEventKind::Cleaned,
-            SystemTime::now(),
+            mutation_time(),
             None,
             Some(EventDetail {
                 outcome: Some(outcome),
@@ -2358,7 +2347,7 @@ impl DomainState {
         record_event(
             task,
             TaskEventKind::Edited,
-            SystemTime::now(),
+            mutation_time(),
             None,
             edited_detail(fields),
         );
@@ -2512,7 +2501,7 @@ impl DomainState {
         let added: Vec<Step> = step_adds
             .iter()
             .map(|text| Step {
-                id: Uuid::new_v4(),
+                id: mutation_id(),
                 text: text.trim().to_string(),
                 done: false,
             })
@@ -2527,7 +2516,7 @@ impl DomainState {
         record_event(
             task,
             TaskEventKind::Edited,
-            SystemTime::now(),
+            mutation_time(),
             None,
             edited_detail(fields),
         );
@@ -2584,7 +2573,7 @@ impl DomainState {
         }
         let task = self.task_mut(task_id)?;
         let step = Step {
-            id: Uuid::new_v4(),
+            id: mutation_id(),
             text: text.to_string(),
             done: false,
         };
@@ -2698,7 +2687,7 @@ impl DomainState {
         by: &str,
     ) -> Result<(), DomainError> {
         let task = self.task_mut(id)?;
-        let at = SystemTime::now();
+        let at = mutation_time();
         let from = task.status;
         task.status = status;
         sync_block_with_status(task, at, by);

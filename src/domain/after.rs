@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use uuid::Uuid;
 
+use super::events::mutation_time;
 use super::{
     current_actor, record_event, sync_block_with_status, DomainError, DomainState, EditedField,
     EventDetail, HumanStatus, Task, TaskEventKind, UndoEntry,
@@ -199,7 +200,7 @@ impl DomainState {
         if changed.is_empty() {
             return Ok(false);
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         let mut entries = Vec::with_capacity(changed.len());
         for (id, after) in changed {
             let task = self.task_mut(id)?;
@@ -258,7 +259,7 @@ impl DomainState {
         record_event(
             task,
             TaskEventKind::Edited,
-            SystemTime::now(),
+            mutation_time(),
             None,
             after_detail(),
         );
@@ -296,7 +297,7 @@ impl DomainState {
         record_event(
             task,
             TaskEventKind::Edited,
-            SystemTime::now(),
+            mutation_time(),
             None,
             after_detail(),
         );
@@ -379,7 +380,7 @@ impl DomainState {
         if numbers.is_empty() {
             return;
         }
-        let at = SystemTime::now();
+        let at = mutation_time();
         let mut moved = Vec::new();
         for task in &mut self.tasks {
             // A task already deleted keeps its links: undoing that delete must still match its
@@ -453,7 +454,7 @@ impl DomainState {
     /// prerequisite, undoing it also puts this task back.
     pub fn start_released(&mut self, id: Uuid, after: u64) -> Result<(), DomainError> {
         let by = current_actor();
-        let at = SystemTime::now();
+        let at = mutation_time();
         let task = self.task_mut(id)?;
         let from = task.status;
         task.status = HumanStatus::Started;
@@ -515,7 +516,7 @@ impl DomainState {
         started_revision: Uuid,
     ) -> Result<(), DomainError> {
         let by = current_actor();
-        let at = SystemTime::now();
+        let at = mutation_time();
         let task = self.task_mut(id)?;
         if task.revision != started_revision || task.status != HumanStatus::Started {
             return Ok(());
