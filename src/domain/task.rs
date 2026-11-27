@@ -2894,9 +2894,8 @@ impl DomainState {
 
     /// Assign missing `T` and `N` numbers in deterministic creation order. The store
     /// calls this only under its exclusive lock, immediately before the durable
-    /// replacement. Notice rows never receive a `T` number. Numbers are the store's (later
-    /// the authority's), not an op's: a replay numbers after each op as each save did.
-    pub fn assign_numbers_for_persistence(&mut self) {
+    /// replacement. Notice rows never receive a `T` number.
+    pub(crate) fn assign_numbers_for_persistence(&mut self) {
         let next_after_existing = self
             .tasks
             .iter()

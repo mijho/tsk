@@ -50,10 +50,32 @@ changes share one op, so its events share one time.
 ### Replay gate
 
 `tests/op_replay.rs` records every op a CLI and board session applies
-(`record_ops`), replays them in order on an empty state, numbering after each
-op as each save did, and requires the saved store's exact state. A mutation
-that bypasses `DomainState::apply` fails it. Trash restore and host I/O stay
-outside ops and outside the session.
+(`record_ops`), replays them in order on an empty state, saving through a
+store after each op as each verb saved, and requires the saved store's exact
+state. A path the session runs that bypasses `DomainState::apply` fails it.
+
+Covered: CLI `add` (flags and plan), `edit` (title, notes, append, assignee,
+unassign, thread, due, after, `--on`), `steps` (every action and place),
+`status` (every status, block and review open and edit, done that releases,
+`--force`, `--no-dispatch`), `reply`, `checks`, `archive`, `unarchive`,
+`project` (title, archive, unarchive). Board: done, delete, undo, a marked
+done, set status, the block and review cards, the reply box, and archive.
+
+Not covered yet, each routed through ops by T5 and T6 but not in the session:
+
+- CLI `dispatch`, `clean`, `done --clean` and `--merge`, a released launch,
+  `reply --send`, and `edit --base` (these need a host or git repository).
+- Board quick add and expanded capture (they need the app's capture
+  snapshot), the task-page form and step keys, the start and start-anyway
+  cards, checks on the page, reply approve, unblock, edit and delete, the
+  waiting-on, after, assignee, base and due pickers, chain, hiding an
+  assignee, project title and archive in the picker, and the dispatch,
+  launch and cleanup cards.
+
+Limits: the recorder sees only this thread, so the board's off-loop bulk
+dispatch and async cleanup cannot be gated this way. It records ops when
+applied, not when saved, so a save cancelled through save recovery still
+counts its op. Trash restore and host I/O stay outside ops.
 
 ### Board routing
 
