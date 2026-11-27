@@ -320,10 +320,7 @@ pub fn run_plan(
                         continue;
                     }
                 }
-                let after = match domain
-                    .after_ids(&item.after)
-                    .and_then(|ids| domain.check_new_after(&ids).map(|()| ids))
-                {
+                let after = match domain.resolve_after(None, &item.after) {
                     Ok(after) => after,
                     Err(error) => {
                         failed.push(fail_item(

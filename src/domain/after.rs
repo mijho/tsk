@@ -132,20 +132,57 @@ impl DomainState {
     pub fn check_after(&self, id: Uuid, after: &[Uuid]) -> Result<(), DomainError> {
         let task = self.get(id).ok_or(DomainError::UnknownId(id))?;
         for &prerequisite_id in after {
-            let prerequisite = self.live_prerequisite(prerequisite_id)?;
-            let number = prerequisite.number.unwrap_or_default();
-            if prerequisite_id == id {
-                return Err(DomainError::AfterSelf(number));
-            }
-            if prerequisite.status == HumanStatus::Done && !task.after.contains(&prerequisite_id) {
+            self.check_link(Some(task), self.live_prerequisite(prerequisite_id)?)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the typed numbers `id` (or, with `None`, a task not created yet) is to run
+    /// after, checking each in input order as [`Self::check_after`] and
+    /// [`Self::check_new_after`] do: the first offending number names the refusal.
+    pub fn resolve_after(
+        &self,
+        id: Option<Uuid>,
+        numbers: &[u64],
+    ) -> Result<Vec<Uuid>, DomainError> {
+        let task = id
+            .map(|id| self.get(id).ok_or(DomainError::UnknownId(id)))
+            .transpose()?;
+        numbers
+            .iter()
+            .map(|&number| {
+                if task.is_some_and(|task| task.number == Some(number)) {
+                    return Err(DomainError::AfterSelf(number));
+                }
+                let prerequisite = self
+                    .task_by_number(number)
+                    .ok_or(DomainError::AfterUnknown(number))?;
+                self.check_link(task, prerequisite)?;
+                Ok(prerequisite.id)
+            })
+            .collect()
+    }
+
+    /// One link of `task` (or of a task not created yet) to `prerequisite`.
+    fn check_link(&self, task: Option<&Task>, prerequisite: &Task) -> Result<(), DomainError> {
+        let number = prerequisite.number.unwrap_or_default();
+        let Some(task) = task else {
+            if prerequisite.status == HumanStatus::Done {
                 return Err(DomainError::AfterDone(number));
             }
-            if self.runs_after(prerequisite_id, id) {
-                return Err(DomainError::AfterLoop {
-                    waiting: number,
-                    prerequisite: task.number.unwrap_or_default(),
-                });
-            }
+            return Ok(());
+        };
+        if prerequisite.id == task.id {
+            return Err(DomainError::AfterSelf(number));
+        }
+        if prerequisite.status == HumanStatus::Done && !task.after.contains(&prerequisite.id) {
+            return Err(DomainError::AfterDone(number));
+        }
+        if self.runs_after(prerequisite.id, task.id) {
+            return Err(DomainError::AfterLoop {
+                waiting: number,
+                prerequisite: task.number.unwrap_or_default(),
+            });
         }
         Ok(())
     }
@@ -256,12 +293,7 @@ impl DomainState {
     /// that is not done. Nothing runs after a new task, so it cannot close a loop.
     pub fn check_new_after(&self, after: &[Uuid]) -> Result<(), DomainError> {
         for &id in after {
-            let prerequisite = self.live_prerequisite(id)?;
-            if prerequisite.status == HumanStatus::Done {
-                return Err(DomainError::AfterDone(
-                    prerequisite.number.unwrap_or_default(),
-                ));
-            }
+            self.check_link(None, self.live_prerequisite(id)?)?;
         }
         Ok(())
     }
@@ -864,5 +896,30 @@ mod tests {
             "the done goes back to the status it left"
         );
         assert_eq!(state.get(ids[1]).expect("task").status, HumanStatus::Ready);
+    }
+
+    /// Typed numbers are checked one at a time in input order: the first offending number
+    /// names the refusal, whatever comes after it.
+    #[test]
+    fn typed_numbers_refuse_by_the_first_offending_one() {
+        let (mut state, ids) = board(6);
+        state.set_status(ids[4], HumanStatus::Done).expect("done");
+        link(&mut state, ids[5], &[1]).expect("6 after 1");
+        let resolve = |numbers: &[u64]| state.resolve_after(Some(ids[0]), numbers);
+        assert_eq!(resolve(&[5, 99]), Err(DomainError::AfterDone(5)));
+        assert_eq!(resolve(&[1, 99]), Err(DomainError::AfterSelf(1)));
+        assert_eq!(
+            resolve(&[6, 99]),
+            Err(DomainError::AfterLoop {
+                waiting: 6,
+                prerequisite: 1
+            })
+        );
+        assert_eq!(resolve(&[99, 5]), Err(DomainError::AfterUnknown(99)));
+        assert_eq!(resolve(&[2, 3]), Ok(vec![ids[1], ids[2]]));
+        assert_eq!(
+            state.resolve_after(None, &[2, 5]),
+            Err(DomainError::AfterDone(5))
+        );
     }
 }

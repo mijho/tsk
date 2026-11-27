@@ -289,9 +289,10 @@ migration or design work they imply. What the behaviour *is* lives in the docs
   The done and every released start share one save and one undo entry.
 - A released assigned task's agent launches after that save; a failed launch puts the task
   back to ready. The mechanism is in the doc comments of `src/dispatch.rs`.
-- A delete drops its number from every other task's `after` in the same undo entry
-  (`UndoEntry::SetAfter` leaves); trash purge drops leftovers as bookkeeping. A number no
-  live task carries waits on nothing. A delete never rewrites a task already soft-deleted:
+- `after` is stored by task id; numbers are only its display and input form. A delete drops
+  its id from every other task's `after` in the same undo entry (`UndoEntry::SetAfter`
+  leaves); trash purge drops leftovers as bookkeeping. A prerequisite that is no longer a
+  live task waits on nothing. A delete never rewrites a task already soft-deleted:
   its own delete's undo entry must keep matching.
 - The projectless scope displays as `desk` but serializes as `global` and is
   `TaskScope::Global` internally. Do not rename either without a store migration.
@@ -300,9 +301,11 @@ migration or design work they imply. What the behaviour *is* lives in the docs
 - Store format is versioned (`STORE_FORMAT_VERSION`). Any schema change bumps it and adds
   a `vN → vN+1` step to `MIGRATIONS` in `src/store.rs`. `deny_unknown_fields` stays on
   `Task` and `DomainState` so an older binary refuses a newer file instead of dropping
-  fields. Migrated loads write `tsk.json.v<N>` beside the live file on first save.
+  fields. Migrated loads write `tsk.json.v<N>` beside the live file on first save. Formats
+  8 to 18 were unreleased dev stores: `RETIRED_FORMATS` refuses them and no format reuses one.
 - Trash (`trash.jsonl`) is durable before the live document loses a task, is rewritten
   atomically, and readers dedupe by id and skip torn lines. Nothing on the board reads it.
+  It has no format version: a schema change also teaches `parse_trash_lines` the old line.
 - A bulk verb on a marked set is one domain transaction, one save, and one undo entry
   (`UndoEntry::Batch`, store v5). Never persist it as per-task entries: one `ctrl+u`
   reverses the whole set, and a stale batch refuses without touching any task. The one

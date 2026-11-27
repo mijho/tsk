@@ -302,13 +302,36 @@ fn migrate_with(
 /// that fails UTF-8 (a crash can cut a multibyte title mid-sequence) or JSON,
 /// and dedupe by task id with the last line for an id winning. Every trash
 /// reader and rewrite inherits the dedupe.
-fn parse_trash_lines(content: &[u8]) -> Vec<TrashLine> {
+///
+/// The trash has no format version of its own. A line a v7 store wrote names its task's
+/// `after` by number: `numbers` maps each to its task's id, and a number no task carries is
+/// dropped, as the store migration does. The next trash rewrite saves the ids.
+fn parse_trash_lines(
+    content: &[u8],
+    numbers: &std::collections::BTreeMap<u64, serde_json::Value>,
+) -> Vec<TrashLine> {
     let mut lines: Vec<TrashLine> = Vec::new();
     for entry in content
         .split(|byte| *byte == b'\n')
         .filter_map(|line| std::str::from_utf8(line).ok())
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<TrashLine>(line).ok())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|mut line| {
+            if let Some(after) = line
+                .get_mut("task")
+                .and_then(|task| task.get_mut("after"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                *after = after
+                    .iter()
+                    .filter_map(|link| match link.as_u64() {
+                        Some(number) => numbers.get(&number).cloned(),
+                        None => Some(link.clone()),
+                    })
+                    .collect();
+            }
+            serde_json::from_value::<TrashLine>(line).ok()
+        })
     {
         match lines
             .iter_mut()
@@ -583,7 +606,31 @@ impl TaskStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        Ok(parse_trash_lines(&content))
+        Ok(parse_trash_lines(&content, &self.task_numbers(&content)))
+    }
+
+    /// Task number to task id, from the live document and the trash `content`, for trash lines
+    /// that still name `after` by number. Unreadable files contribute nothing.
+    fn task_numbers(&self, content: &[u8]) -> std::collections::BTreeMap<u64, serde_json::Value> {
+        let live = fs::read(self.state_file())
+            .ok()
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok());
+        let live_tasks = live
+            .as_ref()
+            .and_then(|document| document.get("tasks"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten();
+        let trashed: Vec<serde_json::Value> = content
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .filter_map(|line| line.get("task").cloned())
+            .collect();
+        live_tasks
+            .chain(trashed.iter())
+            .filter(|task| task.get("notice").is_none_or(serde_json::Value::is_null))
+            .filter_map(|task| Some((task.get("number")?.as_u64()?, task.get("id")?.clone())))
+            .collect()
     }
 
     /// Restore one task from trash into the live state under the exclusive lock:
@@ -902,7 +949,7 @@ impl TaskStore {
                         supported,
                     });
                 }
-                Ok(version) if version > supported => {
+                Ok(version) if version > supported || RETIRED_FORMATS.contains(&version) => {
                     return Err(StoreError::UnsupportedFormat {
                         found: version,
                         supported,
@@ -1138,7 +1185,7 @@ impl TaskStore {
             Err(error) => return Err(error.into()),
         };
         let mut kept = String::new();
-        for entry in parse_trash_lines(&content) {
+        for entry in parse_trash_lines(&content, &self.task_numbers(&content)) {
             if keep(&entry) {
                 kept.push_str(&serde_json::to_string(&entry)?);
                 kept.push('\n');
@@ -4065,12 +4112,9 @@ mod tests {
         );
     }
 
-    /// Trash purge unlinks a leftover `after` link once, on the copy that goes to disk. The
-    /// caller takes that copy, so its next edit of the task saves rather than seeing the task
-    /// as changed during save.
     /// A v7 store names `after` links, and the lists its `set_after` undo entries put back,
-    /// by task number. The v8 load names them by task id; a number no task carries is dropped,
-    /// and undo still puts the earlier links back.
+    /// by task number. The v19 load names them by task id; a number no task carries is
+    /// dropped, and undo still puts the earlier links back.
     #[test]
     fn a_v7_store_loads_after_links_and_their_undo_by_task_id() {
         let dir = temp_dir("v7-after");
@@ -4114,6 +4158,49 @@ mod tests {
         assert_eq!(loaded.get(three).expect("task").after, vec![one]);
     }
 
+    /// A trash line a v7 store wrote names its task's `after` by number. It still lists and
+    /// restores, with the links by id, and a number no task carries is dropped.
+    #[test]
+    fn a_v7_trash_line_lists_and_restores_with_its_after_by_id() {
+        let dir = temp_dir("v7-trash");
+        let _guard = TempDirGuard(dir.clone());
+        let seeded = saved_with_titles(&dir, &["one", "two"]);
+        let [one, two] = [0, 1].map(|index| seeded.tasks()[index].id);
+        let store = TaskStore::new(&dir);
+        let mut state = store.load().expect("load");
+        state.set_after(two, &[one]).expect("link");
+        state.soft_delete(two).expect("delete");
+        let mut line = serde_json::to_value(TrashLine {
+            deleted_at: SystemTime::now(),
+            task: state.get(two).expect("task").clone(),
+        })
+        .expect("line");
+        let first = state.get(one).and_then(|task| task.number).expect("number");
+        line["task"]["after"] = serde_json::json!([first, 99]);
+        fs::write(dir.join(TRASH_FILE), format!("{line}\n")).expect("trash");
+        // The live document no longer holds the trashed task.
+        let mut live: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(STATE_FILE)).expect("read")).expect("json");
+        live["tasks"]
+            .as_array_mut()
+            .expect("tasks")
+            .retain(|task| task["id"] != serde_json::json!(two));
+        write_state_json(&dir, live);
+
+        let trash = store.load_trash().expect("trash");
+        assert_eq!(trash.len(), 1, "the v7 line still reads");
+        assert_eq!(trash[0].task.after, vec![one]);
+        let restored = store
+            .restore_from_trash(TrashTarget::Id(two))
+            .expect("restore");
+        assert_eq!(restored.task.after, vec![one]);
+        let live = store.load().expect("load");
+        assert_eq!(live.get(two).expect("restored").after, vec![one]);
+    }
+
+    /// Trash purge unlinks a leftover `after` link once, on the copy that goes to disk. The
+    /// caller takes that copy, so its next edit of the task saves rather than seeing the task
+    /// as changed during save.
     #[test]
     fn a_trash_purge_unlinks_once_so_the_next_edit_saves() {
         let dir = temp_dir("trash-purge-unlink");
@@ -4274,7 +4361,7 @@ mod tests {
             "deleted_at": [1793817827, 0],
             "task": document["tasks"][0],
         });
-        let lines = parse_trash_lines(format!("{line}\n").as_bytes());
+        let lines = parse_trash_lines(format!("{line}\n").as_bytes(), &Default::default());
         assert_eq!(lines.len(), 1, "the pre-host line parses");
         let record = lines[0].task.dispatch.clone().expect("record");
         assert_eq!(record.host, crate::domain::AgentHost::Herdr);
@@ -4312,7 +4399,7 @@ mod tests {
                 "deleted_at": [1793817827, 0],
                 "task": document["tasks"][0],
             });
-            let lines = parse_trash_lines(format!("{line}\n").as_bytes());
+            let lines = parse_trash_lines(format!("{line}\n").as_bytes(), &Default::default());
             let record = lines[0].task.dispatch.clone().expect("trash record");
             assert_eq!(record.host, host, "trash line for {session}");
         }

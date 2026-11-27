@@ -1992,10 +1992,7 @@ fn apply_board_intent(
                     }
                 };
                 let after = form.after.clone();
-                let checked = domain
-                    .after_ids(&after)
-                    .and_then(|ids| domain.check_new_after(&ids));
-                if let Err(error) = checked {
+                if let Err(error) = domain.resolve_after(None, &after) {
                     model.set_message(error.to_string());
                     return Ok(IntentOutcome::None);
                 }
@@ -2454,20 +2451,20 @@ fn apply_board_intent(
             };
             // A refusal (a loop, or a task done meanwhile) keeps the picker open.
             let checked = match target.ids.as_slice() {
-                [] => domain
-                    .after_ids(&after)
-                    .and_then(|after| domain.check_new_after(&after)),
-                ids if target.edit_draft => domain
-                    .after_ids(&after)
-                    .and_then(|after| domain.check_after(ids[0], &after)),
-                ids => domain.after_ids(&after).and_then(|after| {
-                    let intent = Intent::SetAfter {
-                        tasks: ids.to_vec(),
-                        after,
-                        undo: true,
-                    };
-                    super::apply_op(&mut domain.clone(), intent).map(|_| ())
-                }),
+                [] => domain.resolve_after(None, &after).map(|_| ()),
+                ids if target.edit_draft => domain.resolve_after(Some(ids[0]), &after).map(|_| ()),
+                // In input order for the first task, then each task against the links the
+                // earlier ones gain, as one batch.
+                ids => domain
+                    .resolve_after(Some(ids[0]), &after)
+                    .and_then(|after| {
+                        let intent = Intent::SetAfter {
+                            tasks: ids.to_vec(),
+                            after,
+                            undo: true,
+                        };
+                        super::apply_op(&mut domain.clone(), intent).map(|_| ())
+                    }),
             };
             if let Err(error) = checked {
                 model.set_message(error.to_string());
@@ -4916,10 +4913,7 @@ fn confirm_edit(
     // Refused before anything changes: the draft stays for another choice.
     let stored_after = domain.after_numbers(&task);
     if after != stored_after {
-        let checked = domain
-            .after_ids(&after)
-            .and_then(|ids| domain.check_after(id, &ids));
-        if let Err(error) = checked {
+        if let Err(error) = domain.resolve_after(Some(id), &after) {
             model.set_message(error.to_string());
             return Ok(IntentOutcome::None);
         }

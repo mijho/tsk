@@ -245,10 +245,7 @@ fn apply(
     let changed_due = next_due != found.due;
     let changed_after = next_after != found.after;
     let after_ids = if changed_after {
-        let checked = state
-            .after_ids(&next_after)
-            .and_then(|ids| state.check_after(found.id, &ids).map(|()| ids));
-        match checked {
+        match state.resolve_after(Some(found.id), &next_after) {
             Ok(ids) => ids,
             Err(error) => return (Err(after_error(error)), false),
         }
