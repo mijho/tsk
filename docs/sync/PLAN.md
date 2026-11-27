@@ -15,6 +15,18 @@ board (thread `sync-*`), not here. Process: `docs/sync/PROCESS.md`.
 | Wire model | Clients send ops (intents), never proposed state. |
 | Prior art | `feature/s2-multi-user-sync`: keep config, tokens, idempotency, validation, project UUIDs. Drop S2, full-state events, proposed-state mutations. |
 
+### S2 prototype inventory
+
+Use the prototype at `5b65fcd` as reference, not as a branch to merge.
+
+| Prototype files (`src/sync/`) | Carry forward |
+| --- | --- |
+| `config.rs`, `client.rs` | Strict private config for endpoint, workspace, and credentials. Map each host's local project paths to shared project UUIDs, not wire-level absolute paths. |
+| `server.rs` | Authenticate bearer tokens and derive the actor server-side. Store token hashes and scopes in SQLite, not plaintext bearer values in server config. |
+| `client.rs`, `projection.rs` | Persist pending writes before sending. Retry with the same op id. Return the original result for the same actor and op content, and refuse reuse with different content or actor. |
+| `validation.rs` | Keep state and ID invariants. Validate each op and the state it produces through domain functions, not a client-supplied proposed state. |
+| `s2log.rs`, `protocol.rs`, `mod.rs` | Drop the S2 adapter, full-state events, and proposed-state requests. Use the SQLite op log and protocol below. |
+
 ## Model
 
 An **op** is one named domain mutation with an id: `SetStatus`, `ToggleStep`, `SetTitle`,
