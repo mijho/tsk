@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Seed the shared-workspace backlog onto a tsk board. Safe to re-run.
+
+usage: scripts/sync-seed-tasks [backlog.json]
+Uses `tsk` on PATH (override with TSK_BIN). Tasks go in this repo's project scope.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+repo = Path(__file__).resolve().parent.parent
+backlog = Path(sys.argv[1]) if len(sys.argv) > 1 else repo / "docs/sync/backlog.json"
+tsk = os.environ.get("TSK_BIN", "tsk")
+
+
+def run(*args):
+    return subprocess.run([tsk, *args], check=True, capture_output=True, text=True).stdout
+
+
+numbers = {}
+for item in json.loads(backlog.read_text()):
+    args = ["add", "--json", "-p", str(repo), "-t", item["title"], "--thread", item["thread"]]
+    if item.get("notes"):
+        args += ["-n", item["notes"]]
+    result = json.loads(run(*args))
+    n = result["number"]
+    numbers[item["key"]] = n
+    if result["outcome"] == "created":
+        for step in item.get("steps", []):
+            run("steps", f"T{n}", "add", "--", step)
+    after = item.get("after", [])
+    if after and result["outcome"] == "created":
+        run("edit", f"T{n}", *[a for k in after for a in ("--after", f"T{numbers[k]}")])
+    print(f"T{n} {result['outcome']}: {item['title']}")

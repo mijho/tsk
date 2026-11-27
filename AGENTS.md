@@ -435,3 +435,9 @@ rules:
 - Rehearse as a pre-release with isolated state, then promote; the tap updates only after.
 - Never run `tsk update` on a pre-release copy: see the
   [rehearsal traps](packaging/README.md#rehearsal-traps).
+
+## Fork: shared workspace
+
+This fork (`mijho/tsk`) builds the shared workspace on `main`, tracked on its own tsk
+board. Before any work read `docs/sync/PROCESS.md` (how: rounds, validator, push to `main`,
+no PRs) and `docs/sync/PLAN.md` (what). Everything above still holds.
