@@ -12,6 +12,10 @@ first added in the same Unreleased section is not an entry: edit that entry inst
 
 ## Unreleased
 
+### Breaking
+
+- tsk updates your task file on its first save, and tsk 0.14 or older cannot open it afterwards. To go back, restore the `tsk.json.v7` copy beside it.
+
 ## v0.14.1
 
 ### Added

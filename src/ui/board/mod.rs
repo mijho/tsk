@@ -108,22 +108,6 @@ pub(crate) fn start_batch_op(
     )
 }
 
-/// The task ids of prerequisite numbers, as an op carries them.
-pub(crate) fn after_ids(
-    domain: &crate::domain::DomainState,
-    after: &[u64],
-) -> Result<Vec<uuid::Uuid>, crate::domain::DomainError> {
-    after
-        .iter()
-        .map(|number| {
-            domain
-                .task_by_number(*number)
-                .map(|task| task.id)
-                .ok_or(crate::domain::DomainError::AfterUnknown(*number))
-        })
-        .collect()
-}
-
 /// One task-page step change as a board op, with its own steps undo entry.
 pub(crate) fn step_op(
     domain: &mut crate::domain::DomainState,

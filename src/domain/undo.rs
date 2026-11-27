@@ -82,7 +82,7 @@ pub enum UndoEntry {
     /// puts `previous` back.
     SetAfter {
         id: Uuid,
-        previous: Vec<u64>,
+        previous: Vec<Uuid>,
         expected_revision: Uuid,
     },
     /// A change to who the open block or review round waits on; reversing puts `previous`

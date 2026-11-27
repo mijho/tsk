@@ -227,10 +227,10 @@ pub struct Task {
     /// Last successful dispatch. Status changes never alter this record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<Dispatch>,
-    /// Store-global numbers of the tasks this one runs after, in the order they were added.
-    /// The task waits while any of them is not done.
+    /// Ids of the tasks this one runs after, in the order they were added. The task waits
+    /// while any of them is live and not done. Numbers are only their display form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub after: Vec<u64>,
+    pub after: Vec<Uuid>,
     pub status: HumanStatus,
     /// The open record: a block while the task is `blocked`, a review round while it is
     /// `review`. A task from an older store may have none; it reads as on you with no reason.
@@ -649,7 +649,7 @@ fn base_detail(base: &Option<String>) -> Option<EventDetail> {
 }
 
 /// Document version written by this binary.
-pub const STORE_FORMAT_VERSION: u32 = 7;
+pub const STORE_FORMAT_VERSION: u32 = 19;
 
 fn default_next_notice_number() -> u64 {
     1

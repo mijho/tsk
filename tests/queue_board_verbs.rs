@@ -9079,7 +9079,7 @@ fn a_refused_done_with_a_released_start_names_the_done_and_the_task_that_changed
     for stale_is_released in [true, false] {
         let (mut domain, mut model, ids, _store, _guard) =
             numbered_board(&["one", "two"], HumanStatus::Started);
-        domain.set_after(ids[1], &[1]).expect("T2 after T1");
+        domain.set_after(ids[1], &[ids[0]]).expect("T2 after T1");
         domain
             .set_status(ids[1], HumanStatus::Ready)
             .expect("T2 ready");
@@ -9110,7 +9110,7 @@ fn a_refused_done_with_a_released_start_names_the_done_and_the_task_that_changed
 fn a_refused_delete_names_the_deleted_task_when_an_unlinked_one_changed() {
     let (mut domain, mut model, ids, _store, _guard) =
         numbered_board(&["one", "two"], HumanStatus::Ready);
-    domain.set_after(ids[1], &[1]).expect("T2 after T1");
+    domain.set_after(ids[1], &[ids[0]]).expect("T2 after T1");
     domain.soft_delete(ids[0]).expect("delete T1");
     domain
         .set_status(ids[1], HumanStatus::Started)

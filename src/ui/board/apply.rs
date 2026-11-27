@@ -1911,7 +1911,7 @@ fn apply_board_intent(
                     .and_then(|id| model.tasks.iter().find(|task| task.id == id))
                     .cloned();
                 if let (Some(form), Some(task)) = (model.form.as_mut(), saved) {
-                    form.reset_field_to_saved(field, &task);
+                    form.reset_field_to_saved(field, &task, &model.tasks);
                 }
                 model.input_mode = BoardInputMode::TaskPage;
                 model.clear_message();
@@ -1992,7 +1992,10 @@ fn apply_board_intent(
                     }
                 };
                 let after = form.after.clone();
-                if let Err(error) = domain.check_new_after(&after) {
+                let checked = domain
+                    .after_ids(&after)
+                    .and_then(|ids| domain.check_new_after(&ids));
+                if let Err(error) = checked {
                     model.set_message(error.to_string());
                     return Ok(IntentOutcome::None);
                 }
@@ -2383,7 +2386,7 @@ fn apply_board_intent(
                 (
                     first
                         .filter(|_| ids.len() == 1)
-                        .map(|task| task.after.clone())
+                        .map(|task| domain.after_numbers(task))
                         .unwrap_or_default(),
                     first.map_or(TaskScope::Global, |task| task.scope.clone()),
                 )
@@ -2451,9 +2454,13 @@ fn apply_board_intent(
             };
             // A refusal (a loop, or a task done meanwhile) keeps the picker open.
             let checked = match target.ids.as_slice() {
-                [] => domain.check_new_after(&after),
-                ids if target.edit_draft => domain.check_after(ids[0], &after),
-                ids => super::after_ids(domain, &after).and_then(|after| {
+                [] => domain
+                    .after_ids(&after)
+                    .and_then(|after| domain.check_new_after(&after)),
+                ids if target.edit_draft => domain
+                    .after_ids(&after)
+                    .and_then(|after| domain.check_after(ids[0], &after)),
+                ids => domain.after_ids(&after).and_then(|after| {
                     let intent = Intent::SetAfter {
                         tasks: ids.to_vec(),
                         after,
@@ -2478,7 +2485,7 @@ fn apply_board_intent(
             }
             let intent = Intent::SetAfter {
                 tasks: target.ids.clone(),
-                after: super::after_ids(domain, &after)?,
+                after: domain.after_ids(&after)?,
                 undo: true,
             };
             let changed = super::apply_op(domain, intent)?;
@@ -4907,8 +4914,12 @@ fn confirm_edit(
     }
 
     // Refused before anything changes: the draft stays for another choice.
-    if after != task.after {
-        if let Err(error) = domain.check_after(id, &after) {
+    let stored_after = domain.after_numbers(&task);
+    if after != stored_after {
+        let checked = domain
+            .after_ids(&after)
+            .and_then(|ids| domain.check_after(id, &ids));
+        if let Err(error) = checked {
             model.set_message(error.to_string());
             return Ok(IntentOutcome::None);
         }
@@ -4935,8 +4946,8 @@ fn confirm_edit(
         assignee: Some(assignee.clone().map_or(Field::Clear, Field::Set)),
         base: Some(field(base.clone())),
         due: Some(field(due.clone())),
-        after: (after != task.after)
-            .then(|| super::after_ids(domain, &after))
+        after: (after != stored_after)
+            .then(|| domain.after_ids(&after))
             .transpose()?,
         board_steps: Some(FormSteps {
             renames: step_rename_list,

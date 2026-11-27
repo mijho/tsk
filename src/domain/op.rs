@@ -339,8 +339,7 @@ impl DomainState {
                 if self.get(*task).is_some() {
                     return Err(ApplyError::DuplicateId(*task));
                 }
-                let after = self.prerequisite_numbers(after)?;
-                self.check_new_after(&after)?;
+                self.check_new_after(after)?;
                 let mut staged = self.clone();
                 staged.create_with_id(
                     *task,
@@ -352,7 +351,7 @@ impl DomainState {
                 )?;
                 staged.configure_created(*task, assignee.clone(), base.clone())?;
                 staged.set_due_on_create(*task, due.clone())?;
-                staged.set_after_on_create(*task, &after)?;
+                staged.set_after_on_create(*task, after)?;
                 for step in steps {
                     staged.apply_step(
                         *task,
@@ -450,14 +449,13 @@ impl DomainState {
             Intent::SetBase { tasks, base } => self.set_base_batch(tasks, base.clone())?,
             Intent::SetDue { task, due } => self.edit_due(*task, due.clone())?,
             Intent::SetAfter { tasks, after, undo } => {
-                let after = self.prerequisite_numbers(after)?;
                 if *undo {
-                    self.set_after_batch(tasks, &after)?
+                    self.set_after_batch(tasks, after)?
                 } else {
                     let [task] = tasks.as_slice() else {
                         return Err(ApplyError::InvalidIntent("plain SetAfter needs one task"));
                     };
-                    self.edit_after(*task, &after)?
+                    self.edit_after(*task, after)?
                 }
             }
             Intent::ChainAfter { tasks } => self.chain_after(tasks)?,
@@ -595,11 +593,7 @@ impl DomainState {
         let thread = Field::merge(&patch.thread, &before.thread);
         let assignee = Field::merge(&patch.assignee, &before.assigned());
         let base = Field::merge(&patch.base, &before.base);
-        let after = patch
-            .after
-            .as_ref()
-            .map(|ids| self.prerequisite_numbers(ids))
-            .transpose()?;
+        let after = patch.after.as_deref();
         let due = Field::merge(&patch.due, &before.due);
         let mut staged = self.clone();
         let mut changed = title != before.title
@@ -663,17 +657,6 @@ impl DomainState {
             *self = staged;
         }
         Ok(changed)
-    }
-
-    fn prerequisite_numbers(&self, ids: &[Uuid]) -> Result<Vec<u64>, ApplyError> {
-        ids.iter()
-            .map(|id| {
-                self.get(*id)
-                    .ok_or(DomainError::UnknownId(*id))?
-                    .number
-                    .ok_or(ApplyError::UnnumberedPrerequisite(*id))
-            })
-            .collect()
     }
 
     fn apply_step(&mut self, task: Uuid, change: &StepChange) -> Result<bool, ApplyError> {
@@ -1136,7 +1119,7 @@ mod tests {
         assert_eq!(task.assigned(), Some(assignee));
         assert_eq!(task.base.as_deref(), Some("main"));
         assert_eq!(task.due.as_deref(), Some("2026-12-01"));
-        assert_eq!(task.after, [existing_number, other_number]);
+        assert_eq!(state.after_numbers(task), [existing_number, other_number]);
         assert!(!task.archived && !task.soft_deleted);
         assert!(state.hidden_assignees().contains("helper"));
         assert_eq!(state.project_name(&project), "Shared");
@@ -1289,8 +1272,7 @@ mod tests {
             make(&mut state, "waiting"),
         );
         state.assign_numbers_for_persistence();
-        let number = state.get(first).unwrap().number.unwrap();
-        state.set_after(waiting, &[number]).unwrap();
+        state.set_after(waiting, &[first]).unwrap();
         let batch = |tasks: &[Uuid], policy| Intent::StartBatch {
             tasks: tasks
                 .iter()
@@ -1344,8 +1326,7 @@ mod tests {
             make(&mut state, "other"),
         );
         state.assign_numbers_for_persistence();
-        let number = state.get(first).unwrap().number.unwrap();
-        state.set_after(waiting, &[number]).unwrap();
+        state.set_after(waiting, &[first]).unwrap();
         state.set_status(waiting, HumanStatus::Started).unwrap();
         let alone = Intent::SetStatus {
             task: waiting,

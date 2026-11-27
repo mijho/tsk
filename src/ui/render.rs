@@ -339,7 +339,7 @@ pub fn row_wait_label(task: &Task, tasks: &[Task]) -> Option<String> {
     let waiting_before: Vec<u64> = before_numbers(task, tasks)
         .into_iter()
         .filter(|number| {
-            live_task(tasks, *number).is_some_and(|other| other.status != HumanStatus::Done)
+            live_number(tasks, *number).is_some_and(|other| other.status != HumanStatus::Done)
         })
         .collect();
     let before =
@@ -435,7 +435,7 @@ pub fn status_line(task: &Task, tasks: &[Task], now: SystemTime) -> Option<Strin
         let list = waiting
             .into_iter()
             .map(|number| {
-                let status = live_task(tasks, number)
+                let status = live_number(tasks, number)
                     .map_or(HumanStatus::Open, |prerequisite| prerequisite.status);
                 format!("T{number} ({})", crate::domain::status_word(status))
             })
@@ -487,20 +487,38 @@ pub fn status_line(task: &Task, tasks: &[Task], now: SystemTime) -> Option<Strin
 }
 
 /// The live task carrying `number`, from the board's task slice.
-fn live_task(tasks: &[Task], number: u64) -> Option<&Task> {
+fn live_task(tasks: &[Task], id: uuid::Uuid) -> Option<&Task> {
+    tasks
+        .iter()
+        .find(|task| task.id == id && !task.soft_deleted && !task.is_notice())
+}
+
+fn live_number(tasks: &[Task], number: u64) -> Option<&Task> {
     tasks
         .iter()
         .find(|task| task.number == Some(number) && !task.soft_deleted && !task.is_notice())
 }
 
-/// The prerequisites `task` still waits on: live tasks not yet done.
+/// The prerequisites `task` still waits on, by number: live tasks not yet done.
 pub fn waiting_after(task: &Task, tasks: &[Task]) -> Vec<u64> {
     task.after
         .iter()
-        .copied()
-        .filter(|number| {
-            live_task(tasks, *number).is_some_and(|task| task.status != HumanStatus::Done)
+        .filter_map(|id| live_task(tasks, *id))
+        .filter(|prerequisite| prerequisite.status != HumanStatus::Done)
+        .filter_map(|prerequisite| prerequisite.number)
+        .collect()
+}
+
+/// `task`'s prerequisites by the numbers they carry, in its own order.
+pub fn after_numbers(task: &Task, tasks: &[Task]) -> Vec<u64> {
+    task.after
+        .iter()
+        .filter_map(|id| {
+            tasks
+                .iter()
+                .find(|other| other.id == *id && !other.is_notice())
         })
+        .filter_map(|prerequisite| prerequisite.number)
         .collect()
 }
 
@@ -519,13 +537,13 @@ pub fn after_peek_lines(task: &Task, tasks: &[Task]) -> Vec<String> {
     let after = task
         .after
         .iter()
-        .filter_map(|number| {
-            live_task(tasks, *number).map(|prerequisite| {
-                format!(
-                    "T{number} · {}",
-                    crate::domain::status_word(prerequisite.status)
-                )
-            })
+        .filter_map(|id| {
+            let prerequisite = live_task(tasks, *id)?;
+            Some(format!(
+                "T{} · {}",
+                prerequisite.number?,
+                crate::domain::status_word(prerequisite.status)
+            ))
         })
         .collect::<Vec<_>>();
     if !after.is_empty() {
@@ -540,16 +558,16 @@ pub fn after_peek_lines(task: &Task, tasks: &[Task]) -> Vec<String> {
 
 /// The live, unarchived tasks that run after `task`, by number.
 pub fn before_numbers(task: &Task, tasks: &[Task]) -> Vec<u64> {
-    let Some(number) = task.number else {
+    if task.number.is_none() {
         return Vec::new();
-    };
+    }
     let mut before: Vec<u64> = tasks
         .iter()
         .filter(|other| {
             !other.soft_deleted
                 && !other.is_notice()
                 && !other.archived
-                && other.after.contains(&number)
+                && other.after.contains(&task.id)
         })
         .filter_map(|other| other.number)
         .collect();

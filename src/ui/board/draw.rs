@@ -1169,10 +1169,12 @@ fn build_task_page_overlay<'a>(
     // `after T202, T205` beside the base, hidden when empty outside an edit session; the
     // read-only `before T203` follows, derived from the other tasks' `after`.
     let editing_links = capture_form || (form.is_task() && form.editing);
+    let stored_after: Vec<u64> =
+        bound_task.map_or_else(Vec::new, |task| render::after_numbers(task, &model.tasks));
     let shown_after: &[u64] = if editing_links {
         &form.after
     } else {
-        bound_task.map_or(&[], |task| task.after.as_slice())
+        &stored_after
     };
     let after_segment = if !shown_after.is_empty() {
         Some(format!(

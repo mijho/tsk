@@ -1189,7 +1189,7 @@ mod start_tests {
         temp.store().reload_merge_save(&mut state).expect("save");
         let number = |id| state.get(id).and_then(|task| task.number).expect("number");
         let (first_number, second_number) = (number(first), number(second));
-        state.set_after(second, &[first_number]).expect("after");
+        state.set_after(second, &[first]).expect("after");
         temp.store().reload_merge_save(&mut state).expect("save");
         state.set_status(second, HumanStatus::Ready).expect("ready");
         temp.store().reload_merge_save(&mut state).expect("save");
@@ -1430,7 +1430,7 @@ mod start_tests {
             .create("second", None, scope, ProvenanceOrigin::Manual, None)
             .expect("second");
         state.assign_numbers_for_persistence();
-        state.set_after(second, &[1]).expect("after");
+        state.set_after(second, &[first]).expect("after");
         let found = |state: &DomainState| {
             let task = state.get(second).expect("task");
             Some(Found {

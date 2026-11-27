@@ -664,12 +664,12 @@ fn row_for(task: &crate::domain::Task, domain: &DomainState) -> ListRow {
         assignee_kind: task.assignee.as_ref().map(|_| task.assignee_kind.name()),
         base: task.base.clone(),
         due: task.due.clone(),
-        after: task
-            .after
-            .iter()
+        after: domain
+            .after_numbers(task)
+            .into_iter()
             .map(|number| AfterLink {
-                task: *number,
-                done: !waiting.contains(number),
+                task: number,
+                done: !waiting.contains(&number),
             })
             .collect(),
         before: task

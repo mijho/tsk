@@ -320,15 +320,21 @@ pub fn run_plan(
                         continue;
                     }
                 }
-                if let Err(error) = domain.check_new_after(&item.after) {
-                    failed.push(fail_item(
-                        item.i,
-                        Some(item.title),
-                        "invalid-after",
-                        error.to_string(),
-                    ));
-                    continue;
-                }
+                let after = match domain
+                    .after_ids(&item.after)
+                    .and_then(|ids| domain.check_new_after(&ids).map(|()| ids))
+                {
+                    Ok(after) => after,
+                    Err(error) => {
+                        failed.push(fail_item(
+                            item.i,
+                            Some(item.title),
+                            "invalid-after",
+                            error.to_string(),
+                        ));
+                        continue;
+                    }
+                };
                 if let Some(task) = existing_task(
                     domain,
                     &item.title,
@@ -349,11 +355,6 @@ pub fn run_plan(
                     continue;
                 }
                 let id = Uuid::new_v4();
-                let after = item
-                    .after
-                    .iter()
-                    .filter_map(|number| domain.task_by_number(*number).map(|task| task.id))
-                    .collect();
                 let intent = Intent::Create {
                     task: id,
                     title: item.title.clone(),

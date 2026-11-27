@@ -7289,9 +7289,9 @@ fn live_line_tasks() -> Vec<Task> {
         at_secs_ago(5 * 60),
     ));
     let mut after_open = numbered(8, "Waits on two", HumanStatus::Ready, 9 * 3600);
-    after_open.after = vec![22, 23, 20];
+    after_open.after = [22, 23, 20].map(Uuid::from_u128).to_vec();
     let mut after_done = numbered(9, "Waited on a done task", HumanStatus::Ready, 9 * 3600);
-    after_done.after = vec![20];
+    after_done.after = vec![Uuid::from_u128(20)];
     let mut assigned = numbered(10, "Assigned and started", HumanStatus::Started, 9 * 3600);
     assigned.assignee = Some("claude".into());
     let mut archived = blocked(11, "Archived block", "claude", BlockDraft::default(), 60);
@@ -7438,12 +7438,12 @@ fn live_line_tasks() -> Vec<Task> {
         },
         {
             let mut open = numbered(26, "Open and waiting", HumanStatus::Open, 9 * 3600);
-            open.after = vec![23];
+            open.after = vec![Uuid::from_u128(23)];
             open
         },
         {
             let mut chained = numbered(28, "Runs after an open task", HumanStatus::Ready, 9 * 3600);
-            chained.after = vec![26];
+            chained.after = vec![Uuid::from_u128(26)];
             chained
         },
     ]
@@ -8117,7 +8117,7 @@ fn task_page_rail_rows_carry_their_labels() {
         0,
     );
     waits.number = Some(2);
-    waits.after = vec![1];
+    waits.after = vec![Uuid::from_u128(9930)];
     let mut model = BoardModel::from_tasks(vec![item, waits], None);
     let mut domain = DomainState::new();
     for _ in 0..2 {

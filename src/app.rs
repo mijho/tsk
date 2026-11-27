@@ -20356,8 +20356,7 @@ mod quick_assign_tests {
         after: &[uuid::Uuid],
         status: HumanStatus,
     ) {
-        let numbers: Vec<u64> = after.iter().map(|id| number_of(domain, *id)).collect();
-        domain.set_after(waiting, &numbers).expect("after");
+        domain.set_after(waiting, after).expect("after");
         temp.store.reload_merge_save(domain).expect("save");
         if status != HumanStatus::Open {
             domain.set_status(waiting, status).expect("status");
@@ -21058,7 +21057,9 @@ mod quick_assign_tests {
         );
         let disk = temp.store.load().expect("load");
         assert!(disk.get(ids[0]).expect("task").soft_deleted);
-        assert!(disk.get(ids[1]).expect("task").after.is_empty());
+        assert!(disk
+            .after_numbers(disk.get(ids[1]).expect("task"))
+            .is_empty());
         assert_eq!(
             status_of(&disk, ids[1]),
             HumanStatus::Ready,
@@ -21071,7 +21072,10 @@ mod quick_assign_tests {
         handle(&temp, &mut domain, &mut model, BoardIntent::Undo, &mut host);
         let disk = temp.store.load().expect("load");
         assert!(!disk.get(ids[0]).expect("task").soft_deleted);
-        assert_eq!(disk.get(ids[1]).expect("task").after, vec![first]);
+        assert_eq!(
+            disk.after_numbers(disk.get(ids[1]).expect("task")),
+            vec![first]
+        );
     }
 
     #[test]
@@ -21150,9 +21154,17 @@ mod quick_assign_tests {
         );
         let disk = temp.store.load().expect("load");
         let n = |id| number_of(&disk, id);
-        assert_eq!(disk.get(ids[0]).expect("task").after, vec![n(ids[2])]);
-        assert_eq!(disk.get(ids[1]).expect("task").after, vec![n(ids[0])]);
-        assert!(disk.get(ids[2]).expect("task").after.is_empty());
+        assert_eq!(
+            disk.after_numbers(disk.get(ids[0]).expect("task")),
+            vec![n(ids[2])]
+        );
+        assert_eq!(
+            disk.after_numbers(disk.get(ids[1]).expect("task")),
+            vec![n(ids[0])]
+        );
+        assert!(disk
+            .after_numbers(disk.get(ids[2]).expect("task"))
+            .is_empty());
         assert_eq!(
             model.message(),
             Some(format!("chained T{} → T{} → T{}", n(ids[2]), n(ids[0]), n(ids[1])).as_str())
@@ -21161,7 +21173,7 @@ mod quick_assign_tests {
         let disk = temp.store.load().expect("load");
         assert!(ids
             .iter()
-            .all(|id| disk.get(*id).expect("task").after.is_empty()));
+            .all(|id| disk.after_numbers(disk.get(*id).expect("task")).is_empty()));
     }
 
     /// Paste `text` into the open picker's query (a pasted space types, never pins).
@@ -21323,7 +21335,7 @@ mod quick_assign_tests {
         handle(&temp, &mut domain, &mut model, save, &mut host);
         let disk = temp.store.load().expect("load");
         assert_eq!(
-            disk.get(ids[1]).expect("task").after,
+            disk.after_numbers(disk.get(ids[1]).expect("task")),
             vec![n(&disk, 0), n(&disk, 2)]
         );
 
@@ -21449,7 +21461,9 @@ mod quick_assign_tests {
             &mut host,
         );
         let disk = temp.store.load().expect("load");
-        assert!(disk.get(ids[1]).expect("task").after.is_empty());
+        assert!(disk
+            .after_numbers(disk.get(ids[1]).expect("task"))
+            .is_empty());
         assert_eq!(
             model.message(),
             Some(format!("T{} runs after nothing", number_of(&disk, ids[1])).as_str())
@@ -21490,7 +21504,9 @@ mod quick_assign_tests {
             &mut host,
         );
         let disk = temp.store.load().expect("load");
-        assert!(disk.get(ids[2]).expect("task").after.is_empty());
+        assert!(disk
+            .after_numbers(disk.get(ids[2]).expect("task"))
+            .is_empty());
     }
 
     #[test]
@@ -21542,7 +21558,10 @@ mod quick_assign_tests {
             &mut host,
         );
         let disk = temp.store.load().expect("load");
-        assert_eq!(disk.get(ids[2]).expect("task").after, vec![second]);
+        assert_eq!(
+            disk.after_numbers(disk.get(ids[2]).expect("task")),
+            vec![second]
+        );
     }
 
     #[test]
@@ -21705,9 +21724,7 @@ mod quick_assign_tests {
                 None,
             )
             .expect("create task");
-        domain
-            .set_after(elsewhere, &[number_of(&domain, ids[1])])
-            .expect("after");
+        domain.set_after(elsewhere, &[ids[1]]).expect("after");
         temp.store.reload_merge_save(&mut domain).expect("save");
         model.sync_from_domain(&domain);
         let number = number_of(&domain, elsewhere);
@@ -21797,10 +21814,12 @@ mod quick_assign_tests {
         }
         let disk = temp.store.load().expect("load");
         assert_eq!(
-            disk.get(ids[1]).expect("task").after,
+            disk.after_numbers(disk.get(ids[1]).expect("task")),
             vec![number_of(&disk, ids[2])]
         );
-        assert!(disk.get(ids[0]).expect("task").after.is_empty());
+        assert!(disk
+            .after_numbers(disk.get(ids[0]).expect("task"))
+            .is_empty());
     }
 
     #[test]
@@ -21840,7 +21859,10 @@ mod quick_assign_tests {
             &mut host,
         );
         let disk = temp.store.load().expect("load");
-        assert_eq!(disk.get(ids[2]).expect("task").after, vec![first]);
+        assert_eq!(
+            disk.after_numbers(disk.get(ids[2]).expect("task")),
+            vec![first]
+        );
     }
 
     #[test]
@@ -21921,7 +21943,7 @@ mod quick_assign_tests {
         );
         let disk = temp.store.load().expect("load");
         for id in [ids[1], ids[2]] {
-            assert_eq!(disk.get(id).expect("task").after, vec![first]);
+            assert_eq!(disk.after_numbers(disk.get(id).expect("task")), vec![first]);
         }
         assert!(matches!(
             domain.last_undo(),
@@ -21931,7 +21953,7 @@ mod quick_assign_tests {
         let disk = temp.store.load().expect("load");
         assert!([ids[1], ids[2]]
             .iter()
-            .all(|id| disk.get(*id).expect("task").after.is_empty()));
+            .all(|id| disk.after_numbers(disk.get(*id).expect("task")).is_empty()));
     }
 
     #[test]
@@ -22024,7 +22046,7 @@ mod quick_assign_tests {
         );
         let disk = temp.store.load().expect("load");
         let task = disk.get(ids[1]).expect("task");
-        assert_eq!(task.after, vec![number_of(&disk, ids[0])]);
+        assert_eq!(disk.after_numbers(task), vec![number_of(&disk, ids[0])]);
         assert_eq!(
             crate::activity::paper_trail(task)[0].text,
             "after edited",
@@ -22094,7 +22116,11 @@ mod quick_assign_tests {
         let disk = temp.store.load().expect("load");
         let task = disk.get(ids[1]).expect("task");
         assert_eq!(task.title, "second renamed");
-        assert_eq!(task.after, vec![first], "the page save kept the link");
+        assert_eq!(
+            disk.after_numbers(task),
+            vec![first],
+            "the page save kept the link"
+        );
     }
 
     #[test]
@@ -22165,7 +22191,7 @@ mod quick_assign_tests {
             .iter()
             .find(|task| task.title == "Waits")
             .expect("created");
-        assert_eq!(created.after, vec![first]);
+        assert_eq!(disk.after_numbers(created), vec![first]);
     }
 
     /// `!w` carried onto the expanded quick-add page saves with the form; a prerequisite done
@@ -22202,7 +22228,7 @@ mod quick_assign_tests {
             .iter()
             .find(|task| task.title == "Expanded")
             .expect("created from the page");
-        assert_eq!(created.after, vec![first]);
+        assert_eq!(disk.after_numbers(created), vec![first]);
 
         expand(
             &mut domain,

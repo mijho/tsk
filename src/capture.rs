@@ -160,16 +160,7 @@ struct Create<'a> {
 /// Create the task as one op, with fresh task and step ids.
 fn create(state: &mut DomainState, task: Create<'_>) -> Result<TaskId, DomainError> {
     let id = Uuid::new_v4();
-    let after = task
-        .after
-        .iter()
-        .map(|number| {
-            state
-                .task_by_number(*number)
-                .map(|task| task.id)
-                .ok_or(DomainError::AfterUnknown(*number))
-        })
-        .collect::<Result<_, _>>()?;
+    let after = state.after_ids(task.after)?;
     let steps = task
         .steps
         .iter()
@@ -295,7 +286,8 @@ pub fn lift_quick_add_tokens(
                     .and_then(|argument| crate::cli::parser::parse_after_number(argument).ok())
                     .ok_or_else(|| "!w needs a task number like T12".to_string())?;
                 domain
-                    .check_new_after(&[number])
+                    .after_ids(&[number])
+                    .and_then(|ids| domain.check_new_after(&ids))
                     .map_err(|error| error.to_string())?;
                 if !after.contains(&number) {
                     after.push(number);

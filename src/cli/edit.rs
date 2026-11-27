@@ -157,7 +157,7 @@ pub fn run(
                     assignee: task.assigned(),
                     base: task.base.clone(),
                     due: task.due.clone(),
-                    after: task.after.clone(),
+                    after: state.after_numbers(task),
                     soft_deleted: task.soft_deleted,
                 });
             Ok(apply(state, found, &edit))
@@ -244,11 +244,17 @@ fn apply(
     let next_due = fields.due.clone().unwrap_or_else(|| found.due.clone());
     let changed_due = next_due != found.due;
     let changed_after = next_after != found.after;
-    if changed_after {
-        if let Err(error) = state.check_after(found.id, &next_after) {
-            return (Err(after_error(error)), false);
+    let after_ids = if changed_after {
+        let checked = state
+            .after_ids(&next_after)
+            .and_then(|ids| state.check_after(found.id, &ids).map(|()| ids));
+        match checked {
+            Ok(ids) => ids,
+            Err(error) => return (Err(after_error(error)), false),
         }
-    }
+    } else {
+        Vec::new()
+    };
     let on = match fields.on.as_ref() {
         Some((value, profiles)) => match waiting_on(state, found.id, number, value, profiles) {
             Ok(on) => Some(on),
@@ -295,12 +301,7 @@ fn apply(
         assignee: (next_assignee != found.assignee)
             .then(|| next_assignee.clone().map_or(Field::Clear, Field::Set)),
         base: (next_base != found.base).then(|| set(next_base.clone())),
-        after: changed_after.then(|| {
-            next_after
-                .iter()
-                .filter_map(|number| state.task_by_number(*number).map(|task| task.id))
-                .collect()
-        }),
+        after: changed_after.then_some(after_ids),
         ..TaskPatch::default()
     };
     if patch != TaskPatch::default() {

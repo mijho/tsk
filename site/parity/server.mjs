@@ -6,8 +6,11 @@ const fixture = JSON.parse(
   await readFile(resolve(root, "../tests/fixtures/demo-parity/store.json")),
 );
 const now = 1700000200000;
+// The store links `after` by task id; the demo shows and keys them by number.
+const numberOf = new Map(fixture.tasks.map((t) => [t.id, t.number]));
 const tasks = fixture.tasks.map((t) => ({
   ...t,
+  after: (t.after ?? []).map((id) => numberOf.get(id)).filter((n) => n != null),
   project: t.scope.project?.path.split("/").pop() ?? null,
   createdAt: t.created_at[0] * 1000,
   updatedAt: t.updated_at[0] * 1000,

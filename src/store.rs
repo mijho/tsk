@@ -49,8 +49,8 @@ type MigrationStep = fn(serde_json::Value) -> Result<serde_json::Value, StoreErr
 ///
 /// v1 documents gain the empty per-project record map, v2 documents the notice
 /// counter, v3 documents rewrite ready to open, v4 documents gain batch undo, v5
-/// documents gain everything [`migrate_v5_to_v6`] lists, and v6 documents everything
-/// [`migrate_v6_to_v7`] lists.
+/// documents gain everything [`migrate_v5_to_v6`] lists, v6 documents everything
+/// [`migrate_v6_to_v7`] lists, and v7 documents [`migrate_v7_to_v19`] lists.
 const MIGRATIONS: &[MigrationStep] = &[
     migrate_v1_to_v2,
     migrate_v2_to_v3,
@@ -58,7 +58,30 @@ const MIGRATIONS: &[MigrationStep] = &[
     migrate_v4_to_v5,
     migrate_v5_to_v6,
     migrate_v6_to_v7,
+    migrate_v7_to_v19,
+    // 8 to 18 were unreleased dev formats: no store is stamped with one (see
+    // `RETIRED_FORMATS`), so v7 passes through them unchanged.
+    through_retired,
+    through_retired,
+    through_retired,
+    through_retired,
+    through_retired,
+    through_retired,
+    through_retired,
+    through_retired,
+    through_retired,
+    through_retired,
+    through_retired,
 ];
+
+/// Format versions unreleased dev builds stamped on their stores. They are refused like a
+/// newer format, never migrated: their layout is not v7's.
+const RETIRED_FORMATS: std::ops::RangeInclusive<u32> = 8..=18;
+
+/// A step through a retired format number: nothing to change.
+fn through_retired(document: serde_json::Value) -> Result<serde_json::Value, StoreError> {
+    Ok(document)
+}
 
 const _: () = assert!(
     MIGRATIONS.len() + 1 == STORE_FORMAT_VERSION as usize,
@@ -190,8 +213,66 @@ fn migrate_v6_to_v7(mut document: serde_json::Value) -> Result<serde_json::Value
     Ok(document)
 }
 
+/// v7 -> v19: `after` lists, and the `previous` lists of `set_after` undo entries, name tasks by
+/// id instead of number. A number no task carries waited on nothing and is dropped.
+fn migrate_v7_to_v19(mut document: serde_json::Value) -> Result<serde_json::Value, StoreError> {
+    let ids: std::collections::BTreeMap<u64, serde_json::Value> = document
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|task| task.get("notice").is_none_or(serde_json::Value::is_null))
+        .filter_map(|task| Some((task.get("number")?.as_u64()?, task.get("id")?.clone())))
+        .collect();
+    let by_id = |list: &mut serde_json::Value| {
+        if let Some(numbers) = list.as_array_mut() {
+            *numbers = numbers
+                .iter()
+                .filter_map(|number| ids.get(&number.as_u64()?).cloned())
+                .collect();
+        }
+    };
+    for task in document
+        .get_mut("tasks")
+        .and_then(|tasks| tasks.as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(after) = task.get_mut("after") {
+            by_id(after);
+        }
+    }
+    fn walk(value: &mut serde_json::Value, by_id: &dyn Fn(&mut serde_json::Value)) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(previous) = map
+                    .get_mut("set_after")
+                    .and_then(|entry| entry.get_mut("previous"))
+                {
+                    by_id(previous);
+                }
+                map.values_mut().for_each(|child| walk(child, by_id));
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().for_each(|child| walk(child, by_id));
+            }
+            _ => {}
+        }
+    }
+    if let Some(stack) = document.get_mut("undo_stack") {
+        walk(stack, &by_id);
+    }
+    Ok(document)
+}
+
 /// Walk the shipped migration chain from `from` up to the current format.
 fn migrate(document: serde_json::Value, from: u32) -> Result<serde_json::Value, StoreError> {
+    if RETIRED_FORMATS.contains(&from) {
+        return Err(StoreError::UnsupportedFormat {
+            found: from,
+            supported: STORE_FORMAT_VERSION,
+        });
+    }
     migrate_with(document, from, MIGRATIONS)
 }
 
@@ -1208,7 +1289,7 @@ pub fn check_document(document: &[u8]) -> Result<(), RestoreError> {
         .map_err(|_| RestoreError::Invalid("not UTF-8 text".into()))?;
     let found = peek_format_version(text)
         .map_err(|error| RestoreError::Invalid(format!("not a tsk store: {error}")))?;
-    if found == 0 || found > STORE_FORMAT_VERSION {
+    if found == 0 || found > STORE_FORMAT_VERSION || RETIRED_FORMATS.contains(&found) {
         return Err(RestoreError::Unsupported {
             found,
             supported: STORE_FORMAT_VERSION,
@@ -2095,7 +2176,7 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.join(STATE_FILE)).expect("read"))
                 .expect("json");
-        assert_eq!(value["format_version"], 7);
+        assert_eq!(value["format_version"], 19);
         assert_eq!(value["next_notice_number"], 1);
     }
 
@@ -2113,7 +2194,7 @@ mod tests {
             error,
             StoreError::UnsupportedFormat {
                 found: 0,
-                supported: 7
+                supported: 19
             }
         ));
         let on_disk: serde_json::Value =
@@ -2124,7 +2205,7 @@ mod tests {
 
     #[test]
     fn load_refuses_noncurrent_format_without_rewriting() {
-        for format_version in [0, 19] {
+        for format_version in [0, 12, 20] {
             let dir = temp_dir("format-noncurrent");
             let _guard = TempDirGuard(dir.clone());
             let document = serde_json::json!({
@@ -2142,7 +2223,7 @@ mod tests {
                     error,
                     StoreError::UnsupportedFormat {
                         found,
-                        supported: 7
+                        supported: 19
                     } if found == format_version
                 ),
                 "{error}"
@@ -2159,7 +2240,7 @@ mod tests {
         let dir = temp_dir("format-save-state");
         let _guard = TempDirGuard(dir.clone());
         let state: DomainState = serde_json::from_value(serde_json::json!({
-            "format_version": 19,
+            "format_version": 20,
             "next_task_number": 1,
             "tasks": [],
             "undo_stack": []
@@ -2172,8 +2253,8 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::UnsupportedFormat {
-                found: 19,
-                supported: 7
+                found: 20,
+                supported: 19
             }
         ));
         assert!(!dir.join(STATE_FILE).exists());
@@ -2187,7 +2268,7 @@ mod tests {
         store.save(&DomainState::new()).expect("seed current store");
         let before = fs::read(dir.join(STATE_FILE)).expect("read current store");
         let mut local: DomainState = serde_json::from_value(serde_json::json!({
-            "format_version": 19,
+            "format_version": 20,
             "next_task_number": 1,
             "tasks": [],
             "undo_stack": []
@@ -2200,8 +2281,8 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::UnsupportedFormat {
-                found: 19,
-                supported: 7
+                found: 20,
+                supported: 19
             }
         ));
         assert_eq!(
@@ -2215,7 +2296,7 @@ mod tests {
         let dir = temp_dir("format-save-newer");
         let _guard = TempDirGuard(dir.clone());
         let newer = serde_json::json!({
-            "format_version": 19,
+            "format_version": 20,
             "tasks": [],
             "undo_stack": []
         });
@@ -2228,8 +2309,8 @@ mod tests {
             matches!(
                 error,
                 StoreError::UnsupportedFormat {
-                    found: 19,
-                    supported: 7
+                    found: 20,
+                    supported: 19
                 }
             ),
             "{error}"
@@ -3560,7 +3641,7 @@ mod tests {
 
     #[test]
     fn load_refuses_a_higher_version_and_changes_nothing_in_the_state_dir() {
-        for (format_version, supported) in [(19u32, 7u32), (20, 7)] {
+        for (format_version, supported) in [(20u32, 19u32), (21, 19)] {
             let dir = temp_dir("format-higher");
             let _guard = TempDirGuard(dir.clone());
             let document = serde_json::json!({
@@ -3581,7 +3662,7 @@ mod tests {
             assert!(
                 matches!(
                     error,
-                    StoreError::UnsupportedFormat { found, supported: 7 } if found == format_version
+                    StoreError::UnsupportedFormat { found, supported: 19 } if found == format_version
                 ),
                 "{error}"
             );
@@ -3987,6 +4068,52 @@ mod tests {
     /// Trash purge unlinks a leftover `after` link once, on the copy that goes to disk. The
     /// caller takes that copy, so its next edit of the task saves rather than seeing the task
     /// as changed during save.
+    /// A v7 store names `after` links, and the lists its `set_after` undo entries put back,
+    /// by task number. The v8 load names them by task id; a number no task carries is dropped,
+    /// and undo still puts the earlier links back.
+    #[test]
+    fn a_v7_store_loads_after_links_and_their_undo_by_task_id() {
+        let dir = temp_dir("v7-after");
+        let _guard = TempDirGuard(dir.clone());
+        let seeded = saved_with_titles(&dir, &["one", "two", "three"]);
+        let [one, two, three] = [0, 1, 2].map(|index| seeded.tasks()[index].id);
+        let mut state = TaskStore::new(&dir).load().expect("load");
+        state.set_after(three, &[one]).expect("first link");
+        state
+            .set_after_batch(&[three], &[one, two])
+            .expect("second link");
+        TaskStore::new(&dir).save(&state).expect("save");
+        // Rewrite the saved document as v7 wrote it: numbers, plus a purged T9.
+        let number = |id: Uuid| state.get(id).and_then(|task| task.number).expect("number");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(STATE_FILE)).expect("read")).expect("json");
+        document["format_version"] = serde_json::json!(7);
+        let to_numbers = |ids: &[Uuid]| -> serde_json::Value {
+            ids.iter().map(|id| number(*id)).collect::<Vec<_>>().into()
+        };
+        for task in document["tasks"].as_array_mut().expect("tasks") {
+            if task["id"] == serde_json::json!(three) {
+                let mut numbers = to_numbers(&[one, two]);
+                numbers.as_array_mut().expect("list").push(9.into());
+                task["after"] = numbers;
+            }
+        }
+        let undo = document["undo_stack"].as_array_mut().expect("undo");
+        let last = undo.last_mut().expect("the second link's entry");
+        last["set_after"]["previous"] = to_numbers(&[one]);
+        *last = serde_json::json!({ "batch": { "entries": [last.clone()] } });
+        write_state_json(&dir, document);
+
+        let mut loaded = TaskStore::new(&dir).load().expect("v7 migrates");
+        assert_eq!(loaded.get(three).expect("task").after, vec![one, two]);
+        assert_eq!(
+            loaded.after_numbers(loaded.get(three).expect("task")),
+            [1, 2]
+        );
+        loaded.undo().expect("undo the batch");
+        assert_eq!(loaded.get(three).expect("task").after, vec![one]);
+    }
+
     #[test]
     fn a_trash_purge_unlinks_once_so_the_next_edit_saves() {
         let dir = temp_dir("trash-purge-unlink");
@@ -4001,7 +4128,7 @@ mod tests {
         let mut deleter = store.load().expect("load");
         deleter.soft_delete(one).expect("delete");
         store.reload_merge_save(&mut deleter).expect("save delete");
-        local.set_after(three, &[1]).expect("link");
+        local.set_after(three, &[one]).expect("link");
         store.reload_merge_save(&mut local).expect("purge save");
         let disk = store.load().expect("disk");
         assert!(disk.get(one).is_none(), "T1 moved to trash");

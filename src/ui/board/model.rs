@@ -618,7 +618,7 @@ impl BoardForm {
         form.assignee = task.assigned();
         form.base = task.base.clone();
         form.due = seeded_draft(task.due.as_deref().unwrap_or_default());
-        form.after = task.after.clone();
+        form.after = crate::ui::render::after_numbers(task, tasks);
         form.set_agent_names(agent_names);
         form.block.fold = super::block::CheckFold::fresh(task);
         form.block.target = super::block::initial_target(task, form.block.fold.as_ref());
@@ -736,7 +736,12 @@ impl BoardForm {
     }
 
     /// Restore one field's draft to its bound task's saved value (Esc on the task page).
-    pub(super) fn reset_field_to_saved(&mut self, field: CaptureField, task: &Task) {
+    pub(super) fn reset_field_to_saved(
+        &mut self,
+        field: CaptureField,
+        task: &Task,
+        tasks: &[Task],
+    ) {
         match field {
             CaptureField::Title => self.title = seeded_draft(&task.title),
             CaptureField::Notes => {
@@ -759,7 +764,7 @@ impl BoardForm {
                 self.due = seeded_draft(task.due.as_deref().unwrap_or_default());
                 self.due_refusal = None;
             }
-            CaptureField::After => self.after = task.after.clone(),
+            CaptureField::After => self.after = crate::ui::render::after_numbers(task, tasks),
         }
         if let Some(snapshot) = self.task_snapshot.as_mut() {
             match field {
@@ -5984,7 +5989,7 @@ impl BoardModel {
             .as_ref()
             .is_none_or(|snapshot| snapshot.assigned() == form.assignee);
         if let (true, Some(task)) = (untouched, tasks.iter().find(|task| task.id == id)) {
-            form.reset_field_to_saved(CaptureField::Assignee, task);
+            form.reset_field_to_saved(CaptureField::Assignee, task, tasks);
         }
     }
 
@@ -6008,7 +6013,7 @@ impl BoardModel {
             .as_ref()
             .is_none_or(|snapshot| snapshot.base == form.base);
         if let (true, Some(task)) = (untouched, self.tasks.iter().find(|task| task.id == id)) {
-            form.reset_field_to_saved(CaptureField::Base, task);
+            form.reset_field_to_saved(CaptureField::Base, task, &self.tasks);
         }
     }
 
@@ -6026,12 +6031,11 @@ impl BoardModel {
         let Some(id) = form.task_id().filter(|id| ids.contains(id)) else {
             return;
         };
-        let untouched = form
-            .task_snapshot
-            .as_ref()
-            .is_none_or(|snapshot| snapshot.after == form.after);
+        let untouched = form.task_snapshot.as_ref().is_none_or(|snapshot| {
+            crate::ui::render::after_numbers(snapshot, &self.tasks) == form.after
+        });
         if let (true, Some(task)) = (untouched, self.tasks.iter().find(|task| task.id == id)) {
-            form.reset_field_to_saved(CaptureField::After, task);
+            form.reset_field_to_saved(CaptureField::After, task, &self.tasks);
         }
     }
 
@@ -7357,7 +7361,7 @@ impl BoardModel {
             || form.assignee != snapshot.assigned()
             || form.base != snapshot.base
             || form.due.value() != snapshot.due.as_deref().unwrap_or_default()
-            || form.after != snapshot.after
+            || form.after != crate::ui::render::after_numbers(snapshot, &self.tasks)
             || form.scope != snapshot.scope
             || !form.steps.removals.is_empty()
         {

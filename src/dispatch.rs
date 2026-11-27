@@ -5683,8 +5683,7 @@ mod tests {
             .collect();
         store.reload_merge_save(&mut local).expect("save");
         let number = |state: &DomainState, id: Uuid| state.get(id).and_then(|task| task.number);
-        let prerequisites = [ids[0], ids[1]].map(|id| number(&local, id).expect("number"));
-        local.set_after(ids[2], &prerequisites).expect("after");
+        local.set_after(ids[2], &[ids[0], ids[1]]).expect("after");
         store.reload_merge_save(&mut local).expect("save");
         local.set_status(ids[2], HumanStatus::Ready).expect("ready");
         store.reload_merge_save(&mut local).expect("save");
@@ -5708,7 +5707,7 @@ mod tests {
             released,
             vec![Released {
                 number: number(&local, ids[2]).expect("number"),
-                after: prerequisites[0],
+                after: number(&local, ids[0]).expect("number"),
                 start: ReleasedStart::Started,
             }]
         );
@@ -5742,8 +5741,7 @@ mod tests {
             )
             .expect("create");
         store.reload_merge_save(&mut local).expect("save");
-        let first_number = local.get(first).and_then(|task| task.number).expect("T1");
-        local.set_after(second, &[first_number]).expect("after");
+        local.set_after(second, &[first]).expect("after");
         store.reload_merge_save(&mut local).expect("save");
         local.set_status(second, HumanStatus::Ready).expect("ready");
         store.reload_merge_save(&mut local).expect("save");

@@ -170,7 +170,7 @@ impl DispatchIntent {
                 }
                 if prerequisite.id == *task
                     || prerequisite.is_notice()
-                    || !target.after.contains(&number)
+                    || !target.after.contains(&prerequisite.id)
                 {
                     return Err(ApplyError::InvalidIntent(
                         "release prerequisite is not linked to the target",
@@ -494,7 +494,7 @@ mod tests {
         let id = task(&mut original, "waiting");
         original.assign_numbers_for_persistence();
         let number = original.get(prerequisite).unwrap().number.unwrap();
-        original.set_after(id, &[number]).unwrap();
+        original.set_after(id, &[prerequisite]).unwrap();
         original.set_status(id, HumanStatus::Ready).unwrap();
         let start = DispatchIntent::ReleaseStart {
             task: id,
@@ -555,7 +555,7 @@ mod tests {
         let id = task(&mut state, "waiting");
         state.assign_numbers_for_persistence();
         let number = state.get(prerequisite).unwrap().number.unwrap();
-        state.set_after(id, &[number]).unwrap();
+        state.set_after(id, &[prerequisite]).unwrap();
         state.set_status(id, HumanStatus::Ready).unwrap();
         state.complete(prerequisite).unwrap();
         let start = DispatchIntent::ReleaseStart {

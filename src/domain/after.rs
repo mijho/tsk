@@ -1,4 +1,5 @@
-//! `after`: a task runs after other tasks, named by their store-global numbers.
+//! `after`: a task runs after other tasks, stored by task id. Numbers are only their display
+//! and input form: the CLI and board resolve them with [`DomainState::after_ids`].
 //!
 //! A task waits while any prerequisite is not done. When the last one becomes done, a waiting
 //! task in `ready` starts; the board and CLI take [`DomainState::take_completed`] before they
@@ -34,14 +35,10 @@ pub fn status_word(status: HumanStatus) -> &'static str {
     }
 }
 
-/// `numbers` without repeats, first position kept.
-fn dedupe(numbers: &[u64]) -> Vec<u64> {
+/// `ids` without repeats, first position kept.
+fn dedupe(ids: &[Uuid]) -> Vec<Uuid> {
     let mut seen = BTreeSet::new();
-    numbers
-        .iter()
-        .copied()
-        .filter(|number| seen.insert(*number))
-        .collect()
+    ids.iter().copied().filter(|id| seen.insert(*id)).collect()
 }
 
 impl DomainState {
@@ -52,16 +49,42 @@ impl DomainState {
             .find(|task| task.number == Some(number) && !task.soft_deleted && !task.is_notice())
     }
 
-    /// The prerequisites `task` still waits on, in its own order: live tasks not yet done.
-    /// A number no live task carries any more waits on nothing.
+    /// The live (not deleted, not a notice) task with id `id`: a prerequisite that counts.
+    pub fn prerequisite(&self, id: Uuid) -> Option<&Task> {
+        self.get(id)
+            .filter(|task| !task.soft_deleted && !task.is_notice())
+    }
+
+    /// The task ids of prerequisite numbers as typed at the CLI or board; a number no live task
+    /// carries refuses.
+    pub fn after_ids(&self, numbers: &[u64]) -> Result<Vec<Uuid>, DomainError> {
+        numbers
+            .iter()
+            .map(|number| {
+                self.task_by_number(*number)
+                    .map(|task| task.id)
+                    .ok_or(DomainError::AfterUnknown(*number))
+            })
+            .collect()
+    }
+
+    /// `task`'s prerequisites as the numbers the board and CLI show, in its own order. A
+    /// prerequisite purged from the store shows nothing.
+    pub fn after_numbers(&self, task: &Task) -> Vec<u64> {
+        task.after
+            .iter()
+            .filter_map(|id| self.get(*id).filter(|task| !task.is_notice())?.number)
+            .collect()
+    }
+
+    /// The prerequisites `task` still waits on, by number, in its own order: live tasks not yet
+    /// done. A prerequisite that is gone or deleted waits on nothing.
     pub fn waiting_on(&self, task: &Task) -> Vec<u64> {
         task.after
             .iter()
-            .copied()
-            .filter(|number| {
-                self.task_by_number(*number)
-                    .is_some_and(|prerequisite| prerequisite.status != HumanStatus::Done)
-            })
+            .filter_map(|id| self.prerequisite(*id))
+            .filter(|prerequisite| prerequisite.status != HumanStatus::Done)
+            .filter_map(|prerequisite| prerequisite.number)
             .collect()
     }
 
@@ -90,55 +113,64 @@ impl DomainState {
 
     /// The live tasks that run after `number`, by number: the read-only `before` side.
     pub fn before(&self, number: u64) -> Vec<u64> {
+        let Some(id) = self.task_by_number(number).map(|task| task.id) else {
+            return Vec::new();
+        };
         let mut numbers: Vec<u64> = self
             .tasks
             .iter()
-            .filter(|task| !task.soft_deleted && !task.is_notice() && task.after.contains(&number))
+            .filter(|task| !task.soft_deleted && !task.is_notice() && task.after.contains(&id))
             .filter_map(|task| task.number)
             .collect();
         numbers.sort_unstable();
         numbers
     }
 
-    /// Whether `id` may run after every number in `after`: each names a live task other than
+    /// Whether `id` may run after every task in `after`: each is a live task other than
     /// itself, not done (one it already runs after may stay), and none already runs after it,
-    /// directly or through other tasks.
-    pub fn check_after(&self, id: Uuid, after: &[u64]) -> Result<(), DomainError> {
+    /// directly or through other tasks. Refusals name the tasks by number.
+    pub fn check_after(&self, id: Uuid, after: &[Uuid]) -> Result<(), DomainError> {
         let task = self.get(id).ok_or(DomainError::UnknownId(id))?;
-        for &number in after {
-            if task.number == Some(number) {
+        for &prerequisite_id in after {
+            let prerequisite = self.live_prerequisite(prerequisite_id)?;
+            let number = prerequisite.number.unwrap_or_default();
+            if prerequisite_id == id {
                 return Err(DomainError::AfterSelf(number));
             }
-            let prerequisite = self
-                .task_by_number(number)
-                .ok_or(DomainError::AfterUnknown(number))?;
-            if prerequisite.status == HumanStatus::Done && !task.after.contains(&number) {
+            if prerequisite.status == HumanStatus::Done && !task.after.contains(&prerequisite_id) {
                 return Err(DomainError::AfterDone(number));
             }
-            if let Some(own) = task.number {
-                if self.runs_after(number, own) {
-                    return Err(DomainError::AfterLoop {
-                        waiting: number,
-                        prerequisite: own,
-                    });
-                }
+            if self.runs_after(prerequisite_id, id) {
+                return Err(DomainError::AfterLoop {
+                    waiting: number,
+                    prerequisite: task.number.unwrap_or_default(),
+                });
             }
         }
         Ok(())
     }
 
-    /// Whether task `from` runs after task `target`, following `after` links transitively.
-    fn runs_after(&self, from: u64, target: u64) -> bool {
+    /// The live prerequisite `id`; a deleted one refuses by its number, an unknown one by id.
+    fn live_prerequisite(&self, id: Uuid) -> Result<&Task, DomainError> {
+        match self.get(id) {
+            Some(task) if !task.soft_deleted && !task.is_notice() => Ok(task),
+            Some(task) => Err(DomainError::AfterUnknown(task.number.unwrap_or_default())),
+            None => Err(DomainError::UnknownId(id)),
+        }
+    }
+
+    /// Whether task `from` runs after task `target`, following live `after` links transitively.
+    fn runs_after(&self, from: Uuid, target: Uuid) -> bool {
         let mut seen = BTreeSet::new();
         let mut stack = vec![from];
-        while let Some(number) = stack.pop() {
-            if number == target {
+        while let Some(id) = stack.pop() {
+            if id == target {
                 return true;
             }
-            if !seen.insert(number) {
+            if !seen.insert(id) {
                 continue;
             }
-            if let Some(task) = self.task_by_number(number) {
+            if let Some(task) = self.prerequisite(id) {
                 stack.extend(task.after.iter().copied());
             }
         }
@@ -146,14 +178,14 @@ impl DomainState {
     }
 
     /// Set one task's prerequisites and make the change undoable.
-    pub fn set_after(&mut self, id: Uuid, after: &[u64]) -> Result<bool, DomainError> {
+    pub fn set_after(&mut self, id: Uuid, after: &[Uuid]) -> Result<bool, DomainError> {
         self.set_after_batch(&[id], after)
     }
 
     /// Set an ordered task set's prerequisites to the same list as one atomic, undoable action.
     /// Every task is checked against the links the earlier ones gain, so the set cannot close a
     /// loop through itself.
-    pub fn set_after_batch(&mut self, ids: &[Uuid], after: &[u64]) -> Result<bool, DomainError> {
+    pub fn set_after_batch(&mut self, ids: &[Uuid], after: &[Uuid]) -> Result<bool, DomainError> {
         let ids = self.prevalidate_batch_ids(ids)?;
         let after = dedupe(after);
         let changes = ids.into_iter().map(|id| (id, after.clone())).collect();
@@ -166,10 +198,7 @@ impl DomainState {
         let ids = self.prevalidate_batch_ids(ids)?;
         let mut changes = Vec::new();
         for pair in ids.windows(2) {
-            let previous = self
-                .get(pair[0])
-                .and_then(|task| task.number)
-                .ok_or(DomainError::UnknownId(pair[0]))?;
+            let previous = pair[0];
             let task = self.get(pair[1]).ok_or(DomainError::UnknownId(pair[1]))?;
             let mut after = task.after.clone();
             if !after.contains(&previous) {
@@ -182,7 +211,10 @@ impl DomainState {
 
     /// Check every change against the links the earlier ones made, then apply them as one undo
     /// step. Nothing changes when any is refused.
-    fn apply_after_changes(&mut self, changes: Vec<(Uuid, Vec<u64>)>) -> Result<bool, DomainError> {
+    fn apply_after_changes(
+        &mut self,
+        changes: Vec<(Uuid, Vec<Uuid>)>,
+    ) -> Result<bool, DomainError> {
         let mut work = self.clone();
         let mut changed = Vec::new();
         for (id, after) in changes {
@@ -220,15 +252,15 @@ impl DomainState {
         Ok(true)
     }
 
-    /// Whether a task not created yet may run after every number in `after`: each names a live
-    /// task that is not done. Nothing runs after a new task, so it cannot close a loop.
-    pub fn check_new_after(&self, after: &[u64]) -> Result<(), DomainError> {
-        for &number in after {
-            let prerequisite = self
-                .task_by_number(number)
-                .ok_or(DomainError::AfterUnknown(number))?;
+    /// Whether a task not created yet may run after every task in `after`: each is a live task
+    /// that is not done. Nothing runs after a new task, so it cannot close a loop.
+    pub fn check_new_after(&self, after: &[Uuid]) -> Result<(), DomainError> {
+        for &id in after {
+            let prerequisite = self.live_prerequisite(id)?;
             if prerequisite.status == HumanStatus::Done {
-                return Err(DomainError::AfterDone(number));
+                return Err(DomainError::AfterDone(
+                    prerequisite.number.unwrap_or_default(),
+                ));
             }
         }
         Ok(())
@@ -236,7 +268,7 @@ impl DomainState {
 
     /// Give a task created in this same mutation its prerequisites, checked by
     /// [`Self::check_new_after`]. Part of the creation, so no event of its own.
-    pub fn set_after_on_create(&mut self, id: Uuid, after: &[u64]) -> Result<(), DomainError> {
+    pub fn set_after_on_create(&mut self, id: Uuid, after: &[Uuid]) -> Result<(), DomainError> {
         let after = dedupe(after);
         self.check_new_after(&after)?;
         self.task_mut(id)?.after = after;
@@ -244,7 +276,7 @@ impl DomainState {
     }
 
     /// Set one task's prerequisites as an edit, with no undo entry (the CLI's `edit --after`).
-    pub fn edit_after(&mut self, id: Uuid, after: &[u64]) -> Result<bool, DomainError> {
+    pub fn edit_after(&mut self, id: Uuid, after: &[Uuid]) -> Result<bool, DomainError> {
         let after = dedupe(after);
         let task = self.get(id).ok_or(DomainError::UnknownId(id))?;
         if task.soft_deleted {
@@ -268,7 +300,7 @@ impl DomainState {
 
     /// Fold an `after` change into the edit just recorded on `id`: same revision, and its
     /// `edited` event names the field. Checked first by [`Self::check_after`].
-    pub fn stage_after_in_edit(&mut self, id: Uuid, after: &[u64]) -> Result<(), DomainError> {
+    pub fn stage_after_in_edit(&mut self, id: Uuid, after: &[Uuid]) -> Result<(), DomainError> {
         let after = dedupe(after);
         if self.get(id).ok_or(DomainError::UnknownId(id))?.after == after {
             return Ok(());
@@ -291,7 +323,7 @@ impl DomainState {
     }
 
     /// Undo's half of [`Self::set_after`]: put back an earlier list.
-    pub(crate) fn restore_after(&mut self, id: Uuid, after: Vec<u64>) -> Result<(), DomainError> {
+    pub(crate) fn restore_after(&mut self, id: Uuid, after: Vec<Uuid>) -> Result<(), DomainError> {
         let task = self.task_mut(id)?;
         task.after = after;
         record_event(
@@ -307,14 +339,8 @@ impl DomainState {
     /// Drop the just-deleted `ids` from every other task's `after`, returning the undo entries
     /// that put the links back. A task left with nothing to wait on does not start.
     pub(super) fn unlink_deleted(&mut self, ids: &[Uuid], at: SystemTime) -> Vec<UndoEntry> {
-        let numbers: BTreeSet<u64> = ids
-            .iter()
-            .filter_map(|id| self.get(*id).and_then(|task| task.number))
-            .collect();
+        let numbers: BTreeSet<Uuid> = ids.iter().copied().collect();
         let mut entries = Vec::new();
-        if numbers.is_empty() {
-            return entries;
-        }
         for task in &mut self.tasks {
             // A task already deleted keeps its links: undoing that delete must still match its
             // revision, and trash purge drops them.
@@ -339,10 +365,7 @@ impl DomainState {
     /// Before a delete: the `ready` tasks it would leave with nothing to wait on, each with the
     /// deleted prerequisite it waited on. They stay ready; the board says so.
     pub fn unwaited_by_delete(&self, ids: &[Uuid]) -> Vec<(u64, u64)> {
-        let numbers: BTreeSet<u64> = ids
-            .iter()
-            .filter_map(|id| self.get(*id).and_then(|task| task.number))
-            .collect();
+        let numbers: BTreeSet<Uuid> = ids.iter().copied().collect();
         self.tasks
             .iter()
             .filter(|task| {
@@ -352,17 +375,18 @@ impl DomainState {
                     && task.after.iter().any(|n| numbers.contains(n))
             })
             .filter_map(|task| {
-                let left: Vec<u64> = task
+                let left: Vec<Uuid> = task
                     .after
                     .iter()
                     .copied()
                     .filter(|n| !numbers.contains(n))
                     .collect();
                 let waits = left.iter().any(|n| {
-                    self.task_by_number(*n)
+                    self.prerequisite(*n)
                         .is_some_and(|prerequisite| prerequisite.status != HumanStatus::Done)
                 });
                 let gone = task.after.iter().copied().find(|n| numbers.contains(n))?;
+                let gone = self.get(gone)?.number?;
                 (!waits && !self.waiting_on(task).is_empty()).then_some((task.number?, gone))
             })
             .collect()
@@ -371,15 +395,7 @@ impl DomainState {
     /// Trash purge: drop the removed tasks' numbers from every task left. Bookkeeping, not a
     /// user action, so undo entries that expected the old revision follow it.
     pub(super) fn unlink_removed(&mut self, ids: &BTreeSet<Uuid>) {
-        let numbers: BTreeSet<u64> = self
-            .tasks
-            .iter()
-            .filter(|task| ids.contains(&task.id))
-            .filter_map(|task| task.number)
-            .collect();
-        if numbers.is_empty() {
-            return;
-        }
+        let numbers = ids;
         let at = mutation_time();
         let mut moved = Vec::new();
         for task in &mut self.tasks {
@@ -421,11 +437,11 @@ impl DomainState {
     /// The `ready` tasks whose last prerequisite is among `done` (and still done), each with the
     /// prerequisite that released it, in board order by number.
     pub fn released_by(&self, done: &[Uuid]) -> Vec<(Uuid, u64)> {
-        let numbers: Vec<u64> = done
+        let numbers: Vec<Uuid> = done
             .iter()
             .filter_map(|id| self.get(*id))
             .filter(|task| task.status == HumanStatus::Done && !task.soft_deleted)
-            .filter_map(|task| task.number)
+            .map(|task| task.id)
             .collect();
         let mut released: Vec<(Uuid, u64, u64)> = self
             .tasks
@@ -442,7 +458,8 @@ impl DomainState {
                     .iter()
                     .rev()
                     .copied()
-                    .find(|number| task.after.contains(number))?;
+                    .find(|id| task.after.contains(id))?;
+                let by = self.get(by)?.number?;
                 Some((task.id, task.number.unwrap_or(u64::MAX), by))
             })
             .collect();
@@ -610,13 +627,28 @@ mod tests {
     }
 
     fn after(state: &DomainState, id: Uuid) -> Vec<u64> {
-        state.get(id).expect("task").after.clone()
+        state.after_numbers(state.get(id).expect("task"))
+    }
+
+    /// `set_after` by the numbers a user types.
+    fn link(state: &mut DomainState, id: Uuid, numbers: &[u64]) -> Result<bool, DomainError> {
+        let after = state.after_ids(numbers)?;
+        state.set_after(id, &after)
+    }
+
+    fn link_batch(
+        state: &mut DomainState,
+        ids: &[Uuid],
+        numbers: &[u64],
+    ) -> Result<bool, DomainError> {
+        let after = state.after_ids(numbers)?;
+        state.set_after_batch(ids, &after)
     }
 
     #[test]
     fn a_task_runs_after_tasks_in_any_project_and_waits_until_they_are_done() {
         let (mut state, ids) = board(3);
-        assert!(state.set_after(ids[2], &[1, 2, 1]).expect("set"));
+        assert!(link(&mut state, ids[2], &[1, 2, 1]).expect("set"));
         assert_eq!(after(&state, ids[2]), vec![1, 2], "repeats collapse");
         let waiting = state.get(ids[2]).expect("task").clone();
         assert_eq!(state.waiting_on(&waiting), vec![1, 2]);
@@ -624,28 +656,28 @@ mod tests {
         state.set_status(ids[0], HumanStatus::Done).expect("done");
         let waiting = state.get(ids[2]).expect("task").clone();
         assert_eq!(state.waiting_on(&waiting), vec![2]);
-        assert!(!state.set_after(ids[2], &[1, 2]).expect("same list"));
+        assert!(!link(&mut state, ids[2], &[1, 2]).expect("same list"));
     }
 
     #[test]
     fn refuses_itself_unknown_done_and_loops() {
         let (mut state, ids) = board(4);
         assert_eq!(
-            state.set_after(ids[0], &[1]),
+            link(&mut state, ids[0], &[1]),
             Err(DomainError::AfterSelf(1))
         );
         assert_eq!(
-            state.set_after(ids[0], &[9]),
+            link(&mut state, ids[0], &[9]),
             Err(DomainError::AfterUnknown(9))
         );
         state.set_status(ids[3], HumanStatus::Done).expect("done");
         assert_eq!(
-            state.set_after(ids[0], &[4]),
+            link(&mut state, ids[0], &[4]),
             Err(DomainError::AfterDone(4))
         );
-        state.set_after(ids[1], &[1]).expect("2 after 1");
-        state.set_after(ids[2], &[2]).expect("3 after 2");
-        let error = state.set_after(ids[0], &[3]).expect_err("loop through T2");
+        link(&mut state, ids[1], &[1]).expect("2 after 1");
+        link(&mut state, ids[2], &[2]).expect("3 after 2");
+        let error = link(&mut state, ids[0], &[3]).expect_err("loop through T2");
         assert_eq!(
             error,
             DomainError::AfterLoop {
@@ -663,17 +695,15 @@ mod tests {
     #[test]
     fn a_done_prerequisite_already_listed_may_stay() {
         let (mut state, ids) = board(3);
-        state.set_after(ids[2], &[1]).expect("set");
+        link(&mut state, ids[2], &[1]).expect("set");
         state.set_status(ids[0], HumanStatus::Done).expect("done");
-        assert!(state
-            .set_after(ids[2], &[1, 2])
-            .expect("keeps the done one"));
+        assert!(link(&mut state, ids[2], &[1, 2]).expect("keeps the done one"));
     }
 
     #[test]
     fn chain_in_order_links_each_to_the_one_before_as_one_undo() {
         let (mut state, ids) = board(4);
-        state.set_after(ids[3], &[1]).expect("existing link");
+        link(&mut state, ids[3], &[1]).expect("existing link");
         let order = [ids[2], ids[0], ids[3]];
         assert!(state.chain_after(&order).expect("chain"));
         assert_eq!(after(&state, ids[0]), vec![3]);
@@ -688,7 +718,7 @@ mod tests {
     #[test]
     fn a_chain_that_would_close_a_loop_changes_nothing() {
         let (mut state, ids) = board(3);
-        state.set_after(ids[0], &[3]).expect("1 after 3");
+        link(&mut state, ids[0], &[3]).expect("1 after 3");
         let error = state
             .chain_after(&[ids[0], ids[1], ids[2]])
             .expect_err("3 would run after 2 after 1 after 3");
@@ -705,12 +735,11 @@ mod tests {
     #[test]
     fn a_set_over_marked_tasks_cannot_loop_through_itself() {
         let (mut state, ids) = board(3);
-        let error = state
-            .set_after_batch(&[ids[0], ids[1]], &[2])
+        let error = link_batch(&mut state, &[ids[0], ids[1]], &[2])
             .expect_err("T2 cannot run after itself");
         assert_eq!(error, DomainError::AfterSelf(2));
         assert!(after(&state, ids[0]).is_empty(), "nothing applied");
-        assert!(state.set_after_batch(&[ids[0], ids[1]], &[3]).expect("set"));
+        assert!(link_batch(&mut state, &[ids[0], ids[1]], &[3]).expect("set"));
         state.undo().expect("one undo");
         assert!(after(&state, ids[0]).is_empty() && after(&state, ids[1]).is_empty());
     }
@@ -718,8 +747,8 @@ mod tests {
     #[test]
     fn deleting_a_prerequisite_unlinks_it_and_undo_restores_the_links() {
         let (mut state, ids) = board(4);
-        state.set_after(ids[2], &[1]).expect("set");
-        state.set_after(ids[3], &[1, 2]).expect("set");
+        link(&mut state, ids[2], &[1]).expect("set");
+        link(&mut state, ids[3], &[1, 2]).expect("set");
         state.set_status(ids[2], HumanStatus::Ready).expect("ready");
         assert_eq!(state.unwaited_by_delete(&[ids[0]]), vec![(3, 1)]);
         state.soft_delete(ids[0]).expect("delete");
@@ -742,7 +771,7 @@ mod tests {
     #[test]
     fn deleting_a_prerequisite_leaves_an_already_deleted_dependent_undoable() {
         let (mut state, ids) = board(3);
-        state.set_after(ids[2], &[1]).expect("set");
+        link(&mut state, ids[2], &[1]).expect("set");
         state.soft_delete(ids[2]).expect("delete the dependent");
         state.soft_delete(ids[0]).expect("delete the prerequisite");
         state.undo().expect("undo the prerequisite's delete");
@@ -755,7 +784,7 @@ mod tests {
     #[test]
     fn a_bulk_delete_unlinks_in_the_same_undo_entry() {
         let (mut state, ids) = board(3);
-        state.set_after(ids[2], &[1, 2]).expect("set");
+        link(&mut state, ids[2], &[1, 2]).expect("set");
         state.soft_delete_batch(&[ids[0], ids[1]]).expect("delete");
         assert!(after(&state, ids[2]).is_empty());
         state.undo().expect("undo");
@@ -765,7 +794,7 @@ mod tests {
     #[test]
     fn a_delete_with_links_is_not_sent_to_trash_by_its_own_unlinks() {
         let (mut state, ids) = board(2);
-        state.set_after(ids[1], &[1]).expect("set");
+        link(&mut state, ids[1], &[1]).expect("set");
         state.soft_delete(ids[0]).expect("delete");
         assert!(
             state.trash_eligible(SystemTime::now()).is_empty(),
@@ -776,7 +805,7 @@ mod tests {
     #[test]
     fn a_trash_purge_drops_leftover_links() {
         let (mut state, ids) = board(3);
-        state.set_after(ids[2], &[1, 2]).expect("set");
+        link(&mut state, ids[2], &[1, 2]).expect("set");
         // A link the delete could not see: the task carries it, but trash takes the task.
         state.remove_tasks(&BTreeSet::from([ids[0]]));
         assert_eq!(after(&state, ids[2]), vec![2]);
@@ -786,7 +815,7 @@ mod tests {
     fn the_last_prerequisite_done_releases_ready_tasks_only() {
         let (mut state, ids) = board(5);
         for id in &ids[2..] {
-            state.set_after(*id, &[1, 2]).expect("set");
+            link(&mut state, *id, &[1, 2]).expect("set");
         }
         state.set_status(ids[2], HumanStatus::Ready).expect("ready");
         state
@@ -807,7 +836,7 @@ mod tests {
     #[test]
     fn a_released_start_names_its_prerequisite_and_undoes_with_the_done() {
         let (mut state, ids) = board(2);
-        state.set_after(ids[1], &[1]).expect("set");
+        link(&mut state, ids[1], &[1]).expect("set");
         state.set_status(ids[1], HumanStatus::Ready).expect("ready");
         state
             .set_status(ids[0], HumanStatus::Started)
