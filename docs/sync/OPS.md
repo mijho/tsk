@@ -35,9 +35,19 @@ matches emit no op. Record successful creates in input order under the existing 
 | `AddReply(task, record, reply, text)`, `EditReply`, `DeleteReply` (same IDs, optional text), `MarkReplySent(task, record, reply, sent version)` | CLI reply; board reply editor; `reply`, `edit_reply`, `delete_reply`, `mark_reply_sent` | Union inserts by ID; edits and tombstones target one reply. Delivery marks only the still-current round and text. Reply-only saves add no undo. |
 | `InsertStep(task, step, text, anchor)`, `MoveStep(task, step, anchor)`, `ToggleStep(task, step)`, `RenameStep(task, step, text)`, `RemoveStep(task, step)` | CLI steps; board task page and form; `insert_step`, `move_step`, `toggle_step`, `rename_step`, `remove_step` | Union new IDs. Order, edits, and removals target the addressed step. Apply toggle once per op ID; concurrent moves are ordered by the authority. Board `with_steps_undo` or form undo owns the boundary; CLI step verbs add none. |
 
-For board unblock and review send-back, apply the optional reply add or edit before
-`SetStatus` closes that round, in one `as_one_change` transaction. Only status is
-undoable; the reply survives the inverse. Review send-back always targets `started`.
+Reply-box unblock, send-back, and approval address the exact open round, even
+without a reply. A matching task status is not enough. An empty review send-back
+requires a failed check, and a review send-back always targets `started`.
+
+- **Plain unblock or send-back:** Apply the optional reply add or edit before
+  `SetStatus` closes the round, in one `as_one_change` transaction. Only status is
+  undoable; the reply survives the inverse.
+- **Unblock or send-back with dispatch or relaunch:** Save any feedback first,
+  keeping the round open. On successful launch, record dispatch and `started`
+  in a separate save. Refusal or cancellation does not roll back feedback.
+- **Approval:** Save any feedback before entering the normal completion or
+  cleanup route. Cancelling the cleanup card leaves the review open and the
+  feedback saved.
 
 ## Project, dispatch, and maintenance
 
