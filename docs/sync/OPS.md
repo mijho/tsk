@@ -16,7 +16,7 @@ Each op records intent, not a proposed task or store. This is the phase-0 invent
 | `Create(task, scope, provenance, title, notes, thread, assignee, base, due, after, steps)` | CLI add; board quick add and expanded capture: `create_configured`, `set_due_on_create`, `set_after_on_create`, `add_step` | Distinct IDs coexist; number is assigned at save/server, not chosen by caller. Preserve capture provenance and include initial fields and steps in the create. Neither board capture path adds undo. |
 | `EditTask(task, field patch, step intents)` | CLI edit: `edit_with_assignee_and_base`, `edit_due`, `edit_after`, `set_on`; board form: `edit_with_step_changes_and_base`, staged due and after | Scalar fields use last arrival, including an explicit board scope patch (desk or project UUID). CLI edit keeps scope. Only staged step changes get board form undo. Keep CLI edits atomic and preserve `SetOn` undo as described below. |
 | `SetAssignee`, `SetBase`, `SetDue` (task, value or clear) | Board actions and CLI edit; `assign_batch`, `set_base_batch`, `edit_due` | Scalar last arrival with history. Marked actions keep a single batch undo. Any automatic unhide on assignment stays in the same change. |
-| `SetAfter(task, prerequisite IDs)`, `ChainAfter(ordered task IDs)` | CLI edit and create; board after picker and chain; `set_after_batch`, `chain_after` | Validate existence, self-links and cycles against current state. The picker replaces prerequisites; chain appends each predecessor to its successor's existing list if missing. Both board actions have one atomic undo; CLI `edit --after` adds none. Local code still resolves numbers until T7. |
+| `SetAfter(task, prerequisite IDs)`, `ChainAfter(ordered task IDs)` | CLI edit and create; board after picker and chain; `set_after_batch`, `chain_after` | Validate existence, self-links and cycles against current state. Create and edits cannot add an already-done prerequisite, but edits can retain a done link already present. The picker replaces prerequisites; chain appends each missing predecessor. Both board actions have one atomic undo; CLI `edit --after` adds none. Local code still resolves numbers until T7. |
 | `SetStatus(task, from, to)`, `Complete(task, from)` | CLI status, board status/start/done paths; `set_status_by`, `change_status`, `start_batch`, `complete`, `complete_batch` | Flag a stale `from`; preserve close-record effects. Done and its releases share a save. Board status adds undo, and board completion undo includes release effects. CLI ordinary status and done via `set_status_by` add no undo. |
 | `SoftDelete(task)`, `Restore(task)` | Board delete and undo; `soft_delete`, `soft_delete_batch`, `restore` | Tombstone by ID. Clearing prerequisites that point to deleted tasks belongs to that same delete and undo. |
 | `SetArchived(task, archived)`, `ToggleArchived(task)` | CLI archive/unarchive; board `file_tasks`, `unarchive_task` | Keep archive separate from status. Board toggle has single/batch undo. CLI explicit archive/unarchive is idempotent and has no undo. On an archived task with no live archive entry on top, board `ctrl+u` explicitly unarchives without pushing or popping undo. |
@@ -24,6 +24,12 @@ Each op records intent, not a proposed task or store. This is the phase-0 invent
 
 CLI JSON-plan add is partial success, not an atomic `Batch`: refused items and existing
 matches emit no op. Record successful creates in input order under the existing single save.
+
+A user start carries an explicit prerequisite policy in its `SetStatus` intent
+or dispatching-start intent: check prerequisites unless the user chose CLI
+`--force` or confirmed board **Start anyway**. Check ordinary starts against
+current prerequisites at apply time; never infer the override from the target
+status. Release starts have their own completion-driven path.
 
 ## Rounds and steps
 
