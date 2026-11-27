@@ -381,6 +381,13 @@ fn live_task(domain: &DomainState, task: Uuid) -> Result<&Task, DomainError> {
 }
 
 fn matching_round<'a>(task: &'a Task, key: &BlockKey) -> Option<&'a Block> {
+    if task
+        .past_blocks
+        .iter()
+        .any(|block| block.by == key.by && block.at == key.at)
+    {
+        return None;
+    }
     task.block
         .as_ref()
         .filter(|block| block.closed_at.is_none() && block.by == key.by && block.at == key.at)
@@ -532,6 +539,63 @@ mod tests {
 
     fn round(domain: &DomainState, task: Uuid) -> &Block {
         domain.get(task).unwrap().block.as_ref().unwrap()
+    }
+
+    #[test]
+    fn edit_block_and_delete_reply_target_only_the_open_record() {
+        let mut domain = DomainState::new();
+        let task = task(&mut domain, 101);
+        apply(
+            &mut domain,
+            2,
+            OWNER,
+            &RoundIntent::OpenBlock {
+                targets: vec![open_target(task)],
+                mode: OpenRoundMode::Cli,
+                draft: BlockDraft::default(),
+            },
+        )
+        .unwrap();
+        let record = round(&domain, task).key();
+        let edit = RoundIntent::EditBlock {
+            task,
+            record: record.clone(),
+            patch: BlockIntentPatch {
+                why: TextPatch::Set("waiting for a reply".into()),
+                ..BlockIntentPatch::default()
+            },
+        };
+        assert!(apply(&mut domain, 3, OWNER, &edit).unwrap());
+        assert_eq!(
+            round(&domain, task).why.as_deref(),
+            Some("waiting for a reply")
+        );
+        assert!(!apply(&mut domain, 4, OWNER, &edit).unwrap());
+        apply(
+            &mut domain,
+            5,
+            OWNER,
+            &RoundIntent::AddReply {
+                task,
+                record: record.clone(),
+                text: "ready".into(),
+            },
+        )
+        .unwrap();
+        let reply = ReplyKey::of(&round(&domain, task).replies[0]);
+        assert!(apply(
+            &mut domain,
+            6,
+            OWNER,
+            &RoundIntent::DeleteReply {
+                task,
+                record,
+                reply,
+            }
+        )
+        .unwrap());
+        assert!(round(&domain, task).replies[0].deleted);
+        assert_eq!(domain.undo_len(), 0);
     }
 
     #[test]

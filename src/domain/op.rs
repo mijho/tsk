@@ -5,10 +5,10 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::events::with_mutation_inputs;
+use super::events::{mutation_time, with_mutation_inputs};
 use super::{
-    Assignee, DispatchIntent, DomainError, DomainState, HumanStatus, ProvenanceOrigin, RoundIntent,
-    TaskScope,
+    Assignee, BlockKind, DispatchIntent, DomainError, DomainState, HumanStatus, ProvenanceOrigin,
+    RoundIntent, Task, TaskScope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +276,19 @@ impl DomainState {
                     changed |= result.changed;
                     status_conflicts.extend(result.status_conflicts);
                 }
+                // The durable store sees one save, not the intermediate revisions of
+                // each child. Keep any earlier unsaved base as as_one_change does.
+                let before: std::collections::BTreeMap<_, _> =
+                    self.tasks().iter().map(|task| (task.id, task)).collect();
+                for target in &mut staged.tasks {
+                    if let Some(original) = before
+                        .get(&target.id)
+                        .filter(|original| target.revision != original.revision)
+                    {
+                        target.merge_base_revision =
+                            original.merge_base_revision.or(Some(original.revision));
+                    }
+                }
                 *self = staged;
                 changed
             }
@@ -353,6 +366,7 @@ impl DomainState {
                 if actual == *to {
                     false
                 } else {
+                    check_new_status_round(target, *to, actor)?;
                     match (*to, *undo) {
                         (HumanStatus::Done, true) => self.complete(*task)?,
                         (_, true) => {
@@ -375,6 +389,12 @@ impl DomainState {
                     let task = self
                         .get(target.task)
                         .ok_or(DomainError::UnknownId(target.task))?;
+                    if task.soft_deleted {
+                        return Err(DomainError::SoftDeleted(task.id).into());
+                    }
+                    if task.status != *to {
+                        check_new_status_round(task, *to, actor)?;
+                    }
                     if task.status != target.from {
                         status_conflicts.push(StatusConflict {
                             task: task.id,
@@ -428,7 +448,14 @@ impl DomainState {
                 task,
                 archived: false,
             } => self.unarchive_task(*task)?,
-            Intent::ToggleArchived { tasks, marked } => self.file_tasks(tasks, *marked)?,
+            Intent::ToggleArchived { tasks, marked } => {
+                if !marked && tasks.len() != 1 {
+                    return Err(ApplyError::InvalidIntent(
+                        "unmarked ToggleArchived needs one task",
+                    ));
+                }
+                self.file_tasks(tasks, *marked)?
+            }
             Intent::SoftDelete { tasks, marked } => {
                 if *marked {
                     self.soft_delete_batch(tasks)?;
@@ -638,6 +665,29 @@ impl DomainState {
     }
 }
 
+fn check_new_status_round(task: &Task, to: HumanStatus, actor: &str) -> Result<(), ApplyError> {
+    let Some(kind) = BlockKind::for_status(to) else {
+        return Ok(());
+    };
+    if task
+        .block
+        .as_ref()
+        .is_some_and(|record| record.kind == kind)
+    {
+        return Ok(());
+    }
+    let at = mutation_time();
+    if task
+        .block
+        .iter()
+        .chain(&task.past_blocks)
+        .any(|record| record.by == actor && record.at == at)
+    {
+        return Err(ApplyError::InvalidIntent("duplicate legacy round key"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
@@ -823,6 +873,60 @@ mod tests {
     }
 
     #[test]
+    fn step_intents_change_the_addressed_step() {
+        let mut state = DomainState::new();
+        let task = Uuid::from_u128(10);
+        let step = Uuid::from_u128(11);
+        apply(&mut state, 2, create(task, vec![], vec![])).unwrap();
+        let changes = [
+            StepChange::Insert {
+                step: NewStep {
+                    id: step,
+                    text: "original".into(),
+                },
+                anchor: StepAnchor::Start,
+            },
+            StepChange::Rename {
+                step,
+                text: "edited".into(),
+            },
+            StepChange::Toggle { step },
+            StepChange::Remove { step },
+        ];
+        let expected = [
+            Some(("original", false)),
+            Some(("edited", false)),
+            Some(("edited", true)),
+            None,
+        ];
+        for (i, (change, expected)) in changes.into_iter().zip(expected).enumerate() {
+            assert!(
+                apply(
+                    &mut state,
+                    i as u128 + 3,
+                    Intent::Step {
+                        task,
+                        change,
+                        undo: false
+                    }
+                )
+                .unwrap()
+                .changed
+            );
+            assert_eq!(
+                state
+                    .get(task)
+                    .unwrap()
+                    .steps
+                    .first()
+                    .map(|step| (step.text.as_str(), step.done)),
+                expected
+            );
+        }
+        assert_eq!(state.undo_len(), 0);
+    }
+
+    #[test]
     fn explicit_prerequisite_override_does_not_change_normal_start_validation() {
         let mut state = DomainState::new();
         let prerequisite = Uuid::from_u128(10);
@@ -890,11 +994,15 @@ mod tests {
         let mut state = DomainState::new();
         let task = Uuid::from_u128(10);
         let other = Uuid::from_u128(11);
+        let existing = Uuid::from_u128(12);
         let project = "/tmp/tsk-op-demo".to_string();
         let assignee = Assignee::agent("builder");
         apply(&mut state, 2, create(task, vec![], vec![])).unwrap();
         apply(&mut state, 3, create(other, vec![], vec![])).unwrap();
+        apply(&mut state, 17, create(existing, vec![], vec![])).unwrap();
         state.assign_numbers_for_persistence();
+        let other_number = state.get(other).unwrap().number.unwrap();
+        let existing_number = state.get(existing).unwrap().number.unwrap();
         let intents = [
             Intent::SetProjectTitle {
                 project: project.clone(),
@@ -930,7 +1038,7 @@ mod tests {
             },
             Intent::SetAfter {
                 tasks: vec![task],
-                after: vec![other],
+                after: vec![existing],
                 undo: false,
             },
             Intent::ChainAfter {
@@ -941,11 +1049,15 @@ mod tests {
                 marked: true,
             },
             Intent::Restore { task },
+            Intent::HideAssignee {
+                name: "helper".into(),
+            },
         ];
         let mut replica = state.clone();
         for (index, intent) in intents.into_iter().enumerate() {
             let op = index as u128 + 4;
             let first = apply(&mut state, op, intent.clone()).unwrap();
+            assert!(first.changed, "{intent:?} did not change state");
             assert_eq!(first, apply(&mut replica, op, intent).unwrap());
         }
         assert_eq!(
@@ -956,7 +1068,9 @@ mod tests {
         assert_eq!(task.assigned(), Some(assignee));
         assert_eq!(task.base.as_deref(), Some("main"));
         assert_eq!(task.due.as_deref(), Some("2026-12-01"));
+        assert_eq!(task.after, [existing_number, other_number]);
         assert!(!task.archived && !task.soft_deleted);
+        assert!(state.hidden_assignees().contains("helper"));
         assert_eq!(state.project_name(&project), "Shared");
     }
 
@@ -985,5 +1099,103 @@ mod tests {
         apply(&mut state, 6, Intent::Undo).unwrap();
         assert_eq!(state.get(a).unwrap().status, HumanStatus::Open);
         assert_eq!(state.get(b).unwrap().status, HumanStatus::Open);
+    }
+
+    #[test]
+    fn reply_then_unblock_keeps_durable_base_and_status_only_undo() {
+        let task = Uuid::from_u128(10);
+        let mut disk = DomainState::new();
+        apply(&mut disk, 2, create(task, vec![], vec![])).unwrap();
+        disk.block(task, super::super::BlockDraft::default(), "you")
+            .unwrap();
+        disk.clear_merge_bases();
+        let record = disk.get(task).unwrap().block.as_ref().unwrap().key();
+        let mut local = disk.clone();
+        apply(
+            &mut local,
+            3,
+            Intent::Transaction {
+                intents: vec![
+                    Intent::Round {
+                        change: Box::new(RoundIntent::Guard {
+                            task,
+                            record: record.clone(),
+                            require_failed_check: false,
+                        }),
+                    },
+                    Intent::Round {
+                        change: Box::new(RoundIntent::AddReply {
+                            task,
+                            record,
+                            text: "unblocked".into(),
+                        }),
+                    },
+                    status(task, HumanStatus::Blocked, HumanStatus::Started, true),
+                ],
+            },
+        )
+        .unwrap();
+        local.merge_for_save(&disk).unwrap();
+        apply(&mut local, 4, Intent::Undo).unwrap();
+        let task = local.get(task).unwrap();
+        assert_eq!(task.status, HumanStatus::Blocked);
+        assert_eq!(task.block.as_ref().unwrap().replies[0].text, "unblocked");
+    }
+
+    #[test]
+    fn implicit_round_open_refuses_reuse_of_a_closed_key() {
+        let task = Uuid::from_u128(10);
+        let mut state = DomainState::new();
+        apply(&mut state, 2, create(task, vec![], vec![])).unwrap();
+        apply(
+            &mut state,
+            3,
+            status(task, HumanStatus::Open, HumanStatus::Blocked, false),
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            4,
+            status(task, HumanStatus::Blocked, HumanStatus::Started, false),
+        )
+        .unwrap();
+        // Our fixture uses the same actor and time for distinct operations.
+        assert!(apply(
+            &mut state,
+            5,
+            status(task, HumanStatus::Started, HumanStatus::Blocked, false)
+        )
+        .is_err());
+        assert_eq!(state.get(task).unwrap().status, HumanStatus::Started);
+    }
+
+    #[test]
+    fn unmarked_archive_rejects_multiple_targets_before_writing() {
+        let a = Uuid::from_u128(10);
+        let b = Uuid::from_u128(11);
+        let mut state = DomainState::new();
+        apply(&mut state, 2, create(a, vec![], vec![])).unwrap();
+        apply(&mut state, 3, create(b, vec![], vec![])).unwrap();
+        assert!(apply(
+            &mut state,
+            4,
+            Intent::ToggleArchived {
+                tasks: vec![a, b],
+                marked: false
+            }
+        )
+        .is_err());
+        assert!(state.tasks().iter().all(|task| !task.archived));
+        assert_eq!(state.undo_len(), 0);
+    }
+
+    fn status(task: Uuid, from: HumanStatus, to: HumanStatus, undo: bool) -> Intent {
+        Intent::SetStatus {
+            task,
+            from,
+            to,
+            prerequisite_policy: PrerequisitePolicy::NotApplicable,
+            undo,
+        }
     }
 }
