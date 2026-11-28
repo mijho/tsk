@@ -5,6 +5,7 @@ pub mod authority;
 pub mod config;
 pub mod db;
 pub mod server;
+pub mod tokens;
 
 /// The protocol version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;

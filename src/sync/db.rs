@@ -47,6 +47,15 @@ const MIGRATIONS: &[&str] = &[
          seq INTEGER NOT NULL,
          state TEXT NOT NULL
      ) STRICT;",
+    // v3: a token's scope is one the server knows. No server has issued tokens yet, so the
+    // table is replaced rather than copied.
+    "DROP TABLE tokens;
+     CREATE TABLE tokens (
+         hash TEXT PRIMARY KEY,
+         actor TEXT NOT NULL,
+         scope TEXT NOT NULL CHECK (scope IN ('write', 'read'))
+     ) STRICT;
+     CREATE INDEX tokens_actor ON tokens (actor);",
 ];
 
 /// The schema version this build writes.
@@ -62,6 +71,8 @@ pub enum DbError {
     },
     /// A stored op, result, or projection that does not parse, or one that does not encode.
     Json(serde_json::Error),
+    /// A stored or given value the server cannot use, with what is wrong.
+    Corrupt(String),
 }
 
 impl fmt::Display for DbError {
@@ -69,6 +80,7 @@ impl fmt::Display for DbError {
         match self {
             Self::Sqlite(error) => write!(f, "database error: {error}"),
             Self::Json(error) => write!(f, "stored JSON error: {error}"),
+            Self::Corrupt(reason) => f.write_str(reason),
             Self::Newer { found, supported } => write!(
                 f,
                 "database schema {found} is newer than this tsk-sync knows ({supported}): \

@@ -7,6 +7,7 @@ use serde::Deserialize;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use super::authority::{Authority, OpResult};
+use super::tokens::Scope;
 use crate::domain::Op;
 
 /// The largest `POST /ops` body the server reads.
@@ -78,7 +79,35 @@ impl SyncServer {
                 ),
                 Err(error) => failed(&error),
             },
-            (Method::Post, "/ops") => self.post_ops(request),
+            _ => self.authorized(request),
+        }
+    }
+
+    /// Every endpoint but `/health` needs a bearer token; pushing needs write scope.
+    fn authorized(&mut self, request: &mut Request) -> Reply {
+        let token = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Authorization"))
+            .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
+            .map(str::to_string);
+        let Some(token) = token else {
+            return text(
+                401,
+                "a bearer token is required: Authorization: Bearer <token>",
+            );
+        };
+        let grant = match self.authority.grant(&token) {
+            Ok(Some(grant)) => grant,
+            Ok(None) => return text(401, "that token is not one this server issued"),
+            Err(error) => return failed(&error),
+        };
+        match (request.method(), request.url()) {
+            (Method::Post, "/ops") if grant.scope != Scope::Write => text(
+                403,
+                &format!("{}'s token is read-only: it cannot push ops", grant.actor),
+            ),
+            (Method::Post, "/ops") => self.post_ops(request, &grant.actor),
             (Method::Get, "/snapshot") => json(
                 200,
                 serde_json::json!({
@@ -114,7 +143,7 @@ impl SyncServer {
         }
     }
 
-    fn post_ops(&mut self, request: &mut Request) -> Reply {
+    fn post_ops(&mut self, request: &mut Request, actor: &str) -> Reply {
         let mut body = Vec::new();
         let read = request
             .as_reader()
@@ -130,7 +159,7 @@ impl SyncServer {
             Ok(parsed) => parsed,
             Err(error) => return text(400, &format!("not an ops batch: {error}")),
         };
-        match self.authority.submit(&parsed.ops) {
+        match self.authority.submit(actor, &parsed.ops) {
             Ok(results) => json(200, serde_json::json!({ "results": results })),
             Err(error) => failed(&error),
         }
@@ -199,11 +228,20 @@ mod tests {
     use super::*;
     use crate::domain::{Intent, ProvenanceOrigin, TaskScope};
 
-    fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
+    fn request(
+        addr: SocketAddr,
+        token: Option<&str>,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (u16, String) {
         let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        let auth = token.map_or_else(String::new, |token| {
+            format!("Authorization: Bearer {token}\r\n")
+        });
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: tsk\r\nConnection: close\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: tsk\r\nConnection: close\r\n{auth}\
              Content-Length: {}\r\n\r\n{body}",
             body.len()
         )
@@ -222,6 +260,7 @@ mod tests {
     fn post_ops_answers_per_op_and_health_reports_the_seq() {
         let mut db = rusqlite::Connection::open_in_memory().unwrap();
         super::super::db::migrate(&mut db).unwrap();
+        let token = super::super::tokens::add(&db, "you", Scope::Write).unwrap();
         let authority = Authority::load(db).unwrap();
         let mut server = SyncServer::bind("127.0.0.1:0".parse().unwrap(), authority).unwrap();
         let addr = server.local_addr();
@@ -248,7 +287,7 @@ mod tests {
             },
         );
         let batch = serde_json::json!({ "ops": [op] }).to_string();
-        let (status, body) = request(addr, "POST", "/ops", &batch);
+        let (status, body) = request(addr, Some(&token), "POST", "/ops", &batch);
         assert_eq!(status, 200, "{body}");
         let response: OpsResponse = serde_json::from_str(&body).expect("results");
         assert_eq!(
@@ -259,14 +298,23 @@ mod tests {
                 numbers: [(task, 1)].into(),
             }]
         );
-        let (status, body) = request(addr, "GET", "/health", "");
+        let (status, body) = request(addr, Some(&token), "GET", "/health", "");
         assert_eq!(status, 200);
         assert_eq!(body, r#"{"ops":1,"protocol_version":1,"seq":1}"#);
-        let (status, body) = request(addr, "POST", "/ops", r#"{"ops": [], "extra": 1}"#);
+        let (status, body) = request(
+            addr,
+            Some(&token),
+            "POST",
+            "/ops",
+            r#"{"ops": [], "extra": 1}"#,
+        );
         assert_eq!(status, 400, "{body}");
         assert!(body.starts_with("not an ops batch"), "{body}");
-        assert_eq!(request(addr, "POST", "/ops", "not json").0, 400);
-        assert_eq!(request(addr, "GET", "/nope", "").0, 404);
+        assert_eq!(
+            request(addr, Some(&token), "POST", "/ops", "not json").0,
+            400
+        );
+        assert_eq!(request(addr, Some(&token), "GET", "/nope", "").0, 404);
         serving.join().expect("server thread");
     }
 
@@ -274,6 +322,7 @@ mod tests {
     fn snapshot_and_ops_after_page_through_the_log_and_refuse_bad_queries() {
         let mut db = rusqlite::Connection::open_in_memory().unwrap();
         super::super::db::migrate(&mut db).unwrap();
+        let token = super::super::tokens::add(&db, "you", Scope::Write).unwrap();
         let mut authority = Authority::load(db).unwrap();
         let create = |title: &str| {
             Op::local(
@@ -294,7 +343,7 @@ mod tests {
             )
         };
         let ops = [create("one"), create("two"), create("three")];
-        authority.submit(&ops).unwrap();
+        authority.submit("you", &ops).unwrap();
         let state = serde_json::to_value(authority.state()).unwrap();
         let mut server = SyncServer::bind("127.0.0.1:0".parse().unwrap(), authority).unwrap();
         let addr = server.local_addr();
@@ -312,13 +361,13 @@ mod tests {
                 server.serve_one().expect("serve");
             }
         });
-        let (status, body) = request(addr, "GET", "/snapshot", "");
+        let (status, body) = request(addr, Some(&token), "GET", "/snapshot", "");
         assert_eq!(status, 200);
         let snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(snapshot["seq"], 3);
         assert_eq!(snapshot["state"], state);
         let page = |path: &str| {
-            let (status, body) = request(addr, "GET", path, "");
+            let (status, body) = request(addr, Some(&token), "GET", path, "");
             assert_eq!(status, 200, "{path}: {body}");
             serde_json::from_str::<serde_json::Value>(&body).unwrap()
         };
@@ -335,9 +384,39 @@ mod tests {
         assert!(last["next"].is_null());
         assert_eq!(page("/ops?after=3")["ops"], serde_json::json!([]));
         for path in bad {
-            let (status, body) = request(addr, "GET", path, "");
+            let (status, body) = request(addr, Some(&token), "GET", path, "");
             assert_eq!(status, 400, "{path}: {body}");
         }
+        serving.join().expect("server thread");
+    }
+
+    /// Every endpoint but `/health` needs one of the server's tokens, and pushing needs
+    /// write scope; the PWA's read token still reads.
+    #[test]
+    fn requests_need_a_token_and_pushing_needs_write_scope() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&mut db).unwrap();
+        let read = super::super::tokens::add(&db, "phone", Scope::Read).unwrap();
+        let authority = Authority::load(db).unwrap();
+        let mut server = SyncServer::bind("127.0.0.1:0".parse().unwrap(), authority).unwrap();
+        let addr = server.local_addr();
+        let serving = std::thread::spawn(move || {
+            for _ in 0..7 {
+                server.serve_one().expect("serve");
+            }
+        });
+        let batch = r#"{"ops": []}"#;
+        assert_eq!(request(addr, None, "GET", "/health", "").0, 200);
+        assert_eq!(request(addr, None, "GET", "/snapshot", "").0, 401);
+        assert_eq!(request(addr, None, "POST", "/ops", batch).0, 401);
+        assert_eq!(
+            request(addr, Some("tsk_forged"), "GET", "/snapshot", "").0,
+            401
+        );
+        assert_eq!(request(addr, Some(&read), "GET", "/snapshot", "").0, 200);
+        assert_eq!(request(addr, Some(&read), "GET", "/ops?after=0", "").0, 200);
+        let (status, body) = request(addr, Some(&read), "POST", "/ops", batch);
+        assert_eq!(status, 403, "{body}");
         serving.join().expect("server thread");
     }
 }

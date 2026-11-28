@@ -122,7 +122,7 @@ fn the_sync_server_deps_stay_behind_their_feature() {
         .expect("Cargo.toml")
         .parse()
         .expect("toml");
-    let server_deps = ["rusqlite", "tiny_http"];
+    let server_deps = ["rusqlite", "sha2", "tiny_http"];
     for dep in server_deps {
         let spec = &manifest["dependencies"][dep];
         assert_eq!(

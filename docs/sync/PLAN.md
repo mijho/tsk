@@ -83,6 +83,11 @@ claim is refused. A stale claim is flagged, never auto-released (human status is
   `not-on-server`.
 - Endpoints: `POST /ops`, `GET /snapshot`, `GET /ops?after=N`, `GET /events` (SSE),
   `GET /` (PWA). Bearer token per actor; actor lands in every history event.
+- Tokens: `tsk-sync token add <config> <actor> [--read]` prints one once; the database
+  keeps its SHA-256 hash, actor, and scope (`write` or `read`). Every endpoint but
+  `/health` needs `Authorization: Bearer <token>` (401 without one); `POST /ops` needs
+  write scope (403). The token's actor is the op's actor: an op naming another is refused
+  `actor-mismatch`. Ops keep their client `at`, so offline work keeps its time.
 - Protocol version in every request; the server refuses below its minimum. The strict
   unknown-field rule moves from the file to the protocol.
 - Runs as a systemd unit on the VM; exe.dev's proxy fronts HTTPS. Backup: SQLite

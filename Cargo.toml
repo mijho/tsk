@@ -63,6 +63,7 @@ ratatui = "0.30.2"
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = { version = "0.10", optional = true }
 tiny_http = { version = "0.12", optional = true }
 toml_edit = "0.25.13"
 unicode-width = "0.2"
@@ -84,4 +85,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globali
 
 [features]
 # The shared-workspace server. The default `tsk` build and CI matrix pull none of its deps.
-sync-server = ["dep:rusqlite", "dep:tiny_http"]
+sync-server = ["dep:rusqlite", "dep:sha2", "dep:tiny_http"]

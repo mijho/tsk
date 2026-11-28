@@ -75,7 +75,7 @@ same PR, never leave them apart.
 | `src/board_pane.rs` | `--find-board-pane` lookup for the launchers |
 | `src/guides.rs`, `src/announcements.rs`, `src/delivery.rs` | seeded notice tasks |
 | `src/update.rs` | release check, `tsk update` |
-| `src/sync/`, `src/bin/tsk-sync.rs` | the shared-workspace server behind the `sync-server` feature: config, SQLite schema and migrations, the authority (`authority.rs`: seq, numbers, stored results), HTTP |
+| `src/sync/`, `src/bin/tsk-sync.rs` | the shared-workspace server behind the `sync-server` feature: config, SQLite schema and migrations, the authority (`authority.rs`: seq, numbers, stored results), bearer tokens (`tokens.rs`), HTTP |
 | `scripts/open-board.sh`, `scripts/open-capture.sh`, `scripts/*.ps1` | Herdr launchers (embedded via `src/setup.rs`) |
 | `scripts/release.py`, `.github/workflows/release.yml`, `packaging/` | native packaging |
 | `site/` | landing page + Starlight docs (Astro), shell and PowerShell installers, `llms.txt`, `board-demo.js` |

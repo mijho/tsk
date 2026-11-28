@@ -80,15 +80,31 @@ impl Authority {
             .query_row("SELECT count(*) FROM ops", [], |row| row.get(0))?)
     }
 
-    /// Apply `ops` in order as one durable batch. Each op is accepted or refused on its own;
-    /// a resent op (same id, actor, and body) gets its stored result, and an op id reused
-    /// for anything else is refused. Nothing is kept unless the whole batch commits.
-    pub fn submit(&mut self, ops: &[Op]) -> Result<Vec<OpResult>, DbError> {
+    /// The grant a bearer token carries, if it is one of ours.
+    pub fn grant(&self, token: &str) -> Result<Option<super::tokens::Grant>, DbError> {
+        super::tokens::verify(&self.db, token)
+    }
+
+    /// Apply `ops`, pushed by `actor`, in order as one durable batch. Each op is accepted or
+    /// refused on its own: an op that names another actor is refused `actor-mismatch`; a
+    /// resent op (same id, actor, and body) gets its stored result, and an op id reused for
+    /// anything else is refused. Nothing is kept unless the whole batch commits.
+    pub fn submit(&mut self, actor: &str, ops: &[Op]) -> Result<Vec<OpResult>, DbError> {
         let mut state = self.state.clone();
         let mut seq = self.seq;
         let transaction = self.db.transaction()?;
         let mut results = Vec::with_capacity(ops.len());
         for op in ops {
+            if op.actor != actor {
+                results.push(OpResult::Rejected {
+                    op_id: op.id,
+                    reason: format!(
+                        "actor-mismatch: this token speaks for {actor}, the op names {}",
+                        op.actor
+                    ),
+                });
+                continue;
+            }
             let body = serde_json::to_string(op).map_err(DbError::Json)?;
             if let Some(result) = stored(&transaction, op)? {
                 results.push(result);
@@ -326,7 +342,7 @@ mod tests {
             create(second, "second"),
             start(first),
         ];
-        let results = authority.submit(&ops).unwrap();
+        let results = authority.submit("you", &ops).unwrap();
         assert_eq!(
             results,
             [
@@ -363,8 +379,8 @@ mod tests {
         let mut authority = db.authority();
         let task = Uuid::new_v4();
         let op = create(task, "once");
-        let first = authority.submit(std::slice::from_ref(&op)).unwrap();
-        let again = authority.submit(&[op.clone(), op.clone()]).unwrap();
+        let first = authority.submit("you", std::slice::from_ref(&op)).unwrap();
+        let again = authority.submit("you", &[op.clone(), op.clone()]).unwrap();
         assert_eq!(again, [first[0].clone(), first[0].clone()]);
         assert_eq!(authority.op_count().unwrap(), 1, "applied once");
         assert_eq!(authority.state().tasks().len(), 1);
@@ -375,10 +391,17 @@ mod tests {
         other_actor.actor = "pi".into();
         for op in [reused, other_actor] {
             assert!(matches!(
-                authority.submit(std::slice::from_ref(&op)).unwrap().as_slice(),
+                authority.submit(&op.actor.clone(), std::slice::from_ref(&op)).unwrap().as_slice(),
                 [OpResult::Rejected { reason, .. }] if reason.starts_with("op-id-reused")
             ));
         }
+        assert_eq!(authority.op_count().unwrap(), 1);
+        // An op that names an actor other than the token's never reaches the log.
+        let stranger = create(Uuid::new_v4(), "as someone else");
+        assert!(matches!(
+            authority.submit("pi", std::slice::from_ref(&stranger)).unwrap().as_slice(),
+            [OpResult::Rejected { reason, .. }] if reason.starts_with("actor-mismatch")
+        ));
         assert_eq!(authority.op_count().unwrap(), 1);
     }
 
@@ -388,7 +411,9 @@ mod tests {
         let mut authority = db.authority();
         let missing = start(Uuid::new_v4());
         let before = serde_json::to_value(authority.state()).unwrap();
-        let refused = authority.submit(std::slice::from_ref(&missing)).unwrap();
+        let refused = authority
+            .submit("you", std::slice::from_ref(&missing))
+            .unwrap();
         let [OpResult::Rejected { reason, .. }] = refused.as_slice() else {
             panic!("{refused:?}");
         };
@@ -397,7 +422,7 @@ mod tests {
         assert_eq!(serde_json::to_value(authority.state()).unwrap(), before);
         drop(authority);
         let mut reloaded = db.authority();
-        assert_eq!(reloaded.submit(&[missing]).unwrap(), refused);
+        assert_eq!(reloaded.submit("you", &[missing]).unwrap(), refused);
     }
 
     /// A batch commits whole or not at all: a database failure on its second op keeps
@@ -417,7 +442,7 @@ mod tests {
             ))
             .unwrap();
         let before = serde_json::to_value(authority.state()).unwrap();
-        assert!(authority.submit(&ops).is_err());
+        assert!(authority.submit("you", &ops).is_err());
         assert_eq!(authority.seq(), 0);
         assert_eq!(authority.op_count().unwrap(), 0);
         assert_eq!(serde_json::to_value(authority.state()).unwrap(), before);
@@ -428,7 +453,7 @@ mod tests {
         drop(authority);
         let mut reloaded = db.authority();
         assert_eq!(reloaded.seq(), 0, "no projection was written");
-        let results = reloaded.submit(&ops).unwrap();
+        let results = reloaded.submit("you", &ops).unwrap();
         assert_eq!(
             results,
             [
@@ -452,7 +477,7 @@ mod tests {
         let db = TempDb::new();
         let mut authority = db.authority();
         let task = Uuid::new_v4();
-        authority.submit(&[create(task, "kept")]).unwrap();
+        authority.submit("you", &[create(task, "kept")]).unwrap();
         let dispatch = Intent::Dispatch {
             change: Box::new(crate::domain::DispatchIntent::ReleaseStart {
                 task,
@@ -478,7 +503,7 @@ mod tests {
         let state = serde_json::to_value(authority.state()).unwrap();
         for _ in 0..2 {
             // The resend gets the same refusal.
-            let results = authority.submit(&ops).unwrap();
+            let results = authority.submit("you", &ops).unwrap();
             assert!(
                 results.iter().all(|result| matches!(
                     result,
@@ -501,7 +526,7 @@ mod tests {
         let db = TempDb::new();
         let mut authority = db.authority();
         let op = create(Uuid::new_v4(), "stored");
-        let first = authority.submit(std::slice::from_ref(&op)).unwrap();
+        let first = authority.submit("you", std::slice::from_ref(&op)).unwrap();
         let mut value = serde_json::to_value(&op).unwrap();
         let reordered: serde_json::Map<String, serde_json::Value> = value
             .as_object_mut()
@@ -519,7 +544,7 @@ mod tests {
                 params![text, op.id.to_string()],
             )
             .unwrap();
-        assert_eq!(authority.submit(&[op]).unwrap(), first);
+        assert_eq!(authority.submit("you", &[op]).unwrap(), first);
     }
 
     /// A client that takes the snapshot, then replays the ops after its seq with [`accept`],
@@ -530,11 +555,14 @@ mod tests {
         let mut authority = db.authority();
         let (first, second, third) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         authority
-            .submit(&[
-                create(first, "first"),
-                create(second, "second"),
-                start(first),
-            ])
+            .submit(
+                "you",
+                &[
+                    create(first, "first"),
+                    create(second, "second"),
+                    start(first),
+                ],
+            )
             .unwrap();
         let (snapshot_seq, mut replica) = (authority.seq(), authority.state().clone());
         let step = Op::local(
@@ -552,7 +580,7 @@ mod tests {
             },
         );
         let later = [create(third, "third"), step, start(second)];
-        authority.submit(&later).unwrap();
+        authority.submit("you", &later).unwrap();
         assert_eq!(authority.seq(), 6);
 
         let page = authority.ops_after(snapshot_seq, 2).unwrap();
@@ -568,5 +596,26 @@ mod tests {
         );
         assert_eq!(replica.get(third).unwrap().number, Some(3));
         assert!(authority.ops_after(6, 10).unwrap().is_empty());
+    }
+
+    /// The token's actor is who every event of its ops names.
+    #[test]
+    fn events_name_the_actor_that_pushed_the_op() {
+        let db = TempDb::new();
+        let mut authority = db.authority();
+        let task = Uuid::new_v4();
+        let mut made = create(task, "by mark");
+        made.actor = "mark".into();
+        let mut started = start(task);
+        started.actor = "mark".into();
+        let results = authority.submit("mark", &[made, started]).unwrap();
+        assert!(results
+            .iter()
+            .all(|result| matches!(result, OpResult::Accepted { .. })));
+        let history = &authority.state().get(task).unwrap().history;
+        assert_eq!(history.len(), 2);
+        assert!(history
+            .iter()
+            .all(|event| event.by.as_deref() == Some("mark")));
     }
 }
