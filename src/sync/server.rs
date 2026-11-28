@@ -73,7 +73,7 @@ impl SyncServer {
                         "ops": ops,
                     }),
                 ),
-                Err(error) => text(500, &error.to_string()),
+                Err(error) => failed(&error),
             },
             (Method::Post, "/ops") => self.post_ops(request),
             _ => text(404, "not found"),
@@ -98,7 +98,7 @@ impl SyncServer {
         };
         match self.authority.submit(&parsed.ops) {
             Ok(results) => json(200, serde_json::json!({ "results": results })),
-            Err(error) => text(500, &error.to_string()),
+            Err(error) => failed(&error),
         }
     }
 }
@@ -107,6 +107,12 @@ fn json(status: u16, body: serde_json::Value) -> Reply {
     Response::from_string(body.to_string())
         .with_status_code(status)
         .with_header(Header::from_bytes("Content-Type", "application/json").expect("header"))
+}
+
+/// A server-side failure: said to the client and logged here, never only one of the two.
+fn failed(error: &super::db::DbError) -> Reply {
+    eprintln!("tsk-sync: {error}");
+    text(500, &error.to_string())
 }
 
 fn text(status: u16, body: &str) -> Reply {

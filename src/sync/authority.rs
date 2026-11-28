@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::db::DbError;
-use crate::domain::{DomainState, Op};
+use crate::domain::{DomainState, Intent, Op};
 
 /// What became of one submitted op.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,15 +75,22 @@ impl Authority {
         let mut results = Vec::with_capacity(ops.len());
         for op in ops {
             let body = serde_json::to_string(op).map_err(DbError::Json)?;
-            if let Some(result) = stored(&transaction, op, &body)? {
+            if let Some(result) = stored(&transaction, op)? {
                 results.push(result);
                 continue;
             }
             let mut staged = state.clone();
-            let result = match staged.apply(op) {
+            let applied = match server_refusal(op) {
+                Some(reason) => Err(reason.to_string()),
+                None => staged.apply(op).map_err(|error| error.to_string()),
+            };
+            let result = match applied {
                 Ok(_) => {
-                    let before: Vec<Uuid> = numbered(&state);
+                    let before = numbered(&state);
                     staged.assign_numbers_for_persistence();
+                    // Release planning and launches are the server's later work (T20, T22).
+                    staged.take_completed();
+                    staged.take_pending_launches();
                     staged.clear_merge_bases();
                     let numbers: BTreeMap<Uuid, u64> = staged
                         .tasks()
@@ -110,8 +117,7 @@ impl Authority {
                         numbers,
                     }
                 }
-                Err(error) => {
-                    let reason = error.to_string();
+                Err(reason) => {
                     transaction.execute(
                         "INSERT INTO rejections (op_id, actor, body, reason)
                          VALUES (?1, ?2, ?3, ?4)",
@@ -138,8 +144,21 @@ impl Authority {
     }
 }
 
+/// Ops the server does not take yet, and why: their server rules come with later tasks.
+fn server_refusal(op: &Op) -> Option<&'static str> {
+    match op.intent {
+        Intent::Undo => {
+            Some("not-on-server: undo is per actor on the server and lands with its own task (T21)")
+        }
+        Intent::Dispatch { .. } => Some(
+            "not-on-server: dispatch records are host-tagged and land with their own task (T22)",
+        ),
+        _ => None,
+    }
+}
+
 /// The tasks that already have a number.
-fn numbered(state: &DomainState) -> Vec<Uuid> {
+fn numbered(state: &DomainState) -> std::collections::BTreeSet<Uuid> {
     state
         .tasks()
         .iter()
@@ -148,8 +167,15 @@ fn numbered(state: &DomainState) -> Vec<Uuid> {
         .collect()
 }
 
+/// Whether a stored body is `op`: compared parsed, so a change in how ops serialise never
+/// turns a resend into a reuse.
+fn same_op(stored: &str, op: &Op) -> Result<bool, DbError> {
+    let stored: Op = serde_json::from_str(stored).map_err(DbError::Json)?;
+    Ok(stored == *op)
+}
+
 /// The result an op id already has: its own when actor and body match, else a refusal.
-fn stored(db: &Connection, op: &Op, body: &str) -> Result<Option<OpResult>, DbError> {
+fn stored(db: &Connection, op: &Op) -> Result<Option<OpResult>, DbError> {
     let id = op.id.to_string();
     let accepted: Option<(i64, String, String, String)> = db
         .query_row(
@@ -171,7 +197,7 @@ fn stored(db: &Connection, op: &Op, body: &str) -> Result<Option<OpResult>, DbEr
     };
     Ok(match (accepted, rejected) {
         (Some((seq, actor, stored_body, numbers)), _) => {
-            Some(if actor == op.actor && stored_body == body {
+            Some(if actor == op.actor && same_op(&stored_body, op)? {
                 OpResult::Accepted {
                     op_id: op.id,
                     seq,
@@ -182,7 +208,7 @@ fn stored(db: &Connection, op: &Op, body: &str) -> Result<Option<OpResult>, DbEr
             })
         }
         (None, Some((actor, stored_body, reason))) => {
-            Some(if actor == op.actor && stored_body == body {
+            Some(if actor == op.actor && same_op(&stored_body, op)? {
                 OpResult::Rejected {
                     op_id: op.id,
                     reason,
@@ -344,5 +370,58 @@ mod tests {
         drop(authority);
         let mut reloaded = db.authority();
         assert_eq!(reloaded.submit(&[missing]).unwrap(), refused);
+    }
+
+    /// A batch commits whole or not at all: a database failure on its second op keeps
+    /// neither the first op nor any change to the state, the seq, or the numbering.
+    #[test]
+    fn a_batch_that_fails_midway_keeps_nothing() {
+        let db = TempDb::new();
+        let mut authority = db.authority();
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let ops = [create(first, "first"), create(second, "second")];
+        authority
+            .db
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_second BEFORE INSERT ON ops
+                 WHEN NEW.op_id = '{}' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+                ops[1].id
+            ))
+            .unwrap();
+        let before = serde_json::to_value(authority.state()).unwrap();
+        assert!(authority.submit(&ops).is_err());
+        assert_eq!(authority.seq(), 0);
+        assert_eq!(authority.op_count().unwrap(), 0);
+        assert_eq!(serde_json::to_value(authority.state()).unwrap(), before);
+        authority
+            .db
+            .execute_batch("DROP TRIGGER fail_second")
+            .unwrap();
+        drop(authority);
+        let mut reloaded = db.authority();
+        assert_eq!(reloaded.seq(), 0, "no projection was written");
+        let results = reloaded.submit(&ops).unwrap();
+        assert_eq!(
+            results[0],
+            OpResult::Accepted {
+                op_id: ops[0].id,
+                seq: 1,
+                numbers: BTreeMap::from([(first, 1)]),
+            }
+        );
+    }
+
+    /// Undo and dispatch need their own server rules first: they are refused, never logged.
+    #[test]
+    fn undo_and_dispatch_are_refused_until_their_server_rules_land() {
+        let db = TempDb::new();
+        let mut authority = db.authority();
+        let undo = Op::local("you", Intent::Undo);
+        let results = authority.submit(std::slice::from_ref(&undo)).unwrap();
+        assert!(matches!(
+            results.as_slice(),
+            [OpResult::Rejected { reason, .. }] if reason.starts_with("not-on-server")
+        ));
+        assert_eq!(authority.op_count().unwrap(), 0);
     }
 }

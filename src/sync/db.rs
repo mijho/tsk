@@ -27,10 +27,13 @@ const MIGRATIONS: &[&str] = &[
          actor TEXT NOT NULL,
          scope TEXT NOT NULL
      ) STRICT;",
-    // v2: every op keeps its result, so a resent op_id gets the original answer. Accepted
+    // v2: every op keeps its result, so a resent op_id gets the original answer (task_id,
+    // never written, goes). Accepted
     // ops record the numbers their creates got; refused ones keep their reason, unordered.
     // The authority's state is one projection row, written with the ops it reflects.
     "ALTER TABLE ops ADD COLUMN numbers TEXT NOT NULL DEFAULT '{}';
+     DROP INDEX ops_task;
+     ALTER TABLE ops DROP COLUMN task_id;
      CREATE TABLE rejections (
          op_id TEXT PRIMARY KEY,
          actor TEXT NOT NULL,

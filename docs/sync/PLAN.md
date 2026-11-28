@@ -71,8 +71,11 @@ claim is refused. A stale claim is flagged, never auto-released (human status is
   build and CI matrix pull no server deps. Client HTTP uses `ureq` (blocking); the server
   uses `tiny_http` (blocking, no async runtime). Config is `[server] listen, database`,
   every key required and known; the schema version is SQLite's `user_version`.
-- SQLite (`rusqlite`, bundled). Tables: `ops(seq, op_id UNIQUE, actor, at, task_id, body)`,
-  `tasks` (projection), `counters`, `tokens(actor, hash, scope)`, `meta(protocol_version)`.
+- SQLite (`rusqlite`, bundled). Tables: `ops(seq, op_id UNIQUE, actor, at, body, numbers)`,
+  `rejections(op_id, actor, body, reason)`, `projection(seq, state)` (the authority's
+  `DomainState`), `counters`, `tokens(hash, actor, scope)`, `meta(protocol_version)`.
+- The server takes no `Undo` or `Dispatch` op until per-actor undo (T21) and host-tagged
+  dispatch (T22) define them; both are refused `not-on-server`.
 - Endpoints: `POST /ops`, `GET /snapshot`, `GET /ops?after=N`, `GET /events` (SSE),
   `GET /` (PWA). Bearer token per actor; actor lands in every history event.
 - Protocol version in every request; the server refuses below its minimum. The strict
