@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use tsk_tui::sync::{config::Config, db, server::SyncServer};
+use tsk_tui::sync::{authority::Authority, config::Config, db, server::SyncServer};
 
 const USAGE: &str = "usage: tsk-sync migrate <config.toml>\n       tsk-sync serve <config.toml>";
 
@@ -40,9 +40,9 @@ fn run(command: &str, config: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "serve" => {
-            let server = SyncServer::bind(config.listen, connection)?;
+            let mut server = SyncServer::bind(config.listen, Authority::load(connection)?)?;
             println!("tsk-sync: listening on {}", server.local_addr());
-            server.serve();
+            server.serve()?;
             Ok(())
         }
         _ => unreachable!("main checked the command"),

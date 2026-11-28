@@ -36,7 +36,11 @@ call. One op is one undo-entry boundary; a bulk verb is one `Batch` op.
 - **Client.** Replica = server snapshot at cursor `N` + pending ops replayed on top.
   Outbox is durable and ordered; op ids make resend safe.
 - **Push.** `POST /ops` with a batch. The server replays each op against current state,
-  assigns `seq` and task numbers, returns accepted/rejected per op.
+  assigns `seq` and task numbers, returns accepted/rejected per op. Body
+  `{"ops": [Op…]}`; answer `{"results": [{"status": "accepted", "op_id", "seq", "numbers":
+  {task id: number}} | {"status": "rejected", "op_id", "reason"}]}` in order. A resent op
+  (same id, actor, body) gets its stored result; an id reused for anything else is
+  rejected `op-id-reused`. A batch commits as one SQLite transaction with the projection.
 - **Pull.** `GET /ops?after=N` (or the `/events` stream). Client applies, drops confirmed
   ops from the outbox, replays the rest.
 - **Snapshot.** `GET /snapshot` for cold start and catch-up.
