@@ -73,6 +73,7 @@ impl SyncServer {
                     200,
                     serde_json::json!({
                         "protocol_version": super::PROTOCOL_VERSION,
+                        "min_protocol_version": super::MIN_PROTOCOL_VERSION,
                         "seq": self.authority.seq(),
                         "ops": ops,
                     }),
@@ -85,17 +86,12 @@ impl SyncServer {
 
     /// Every endpoint but `/health` needs a bearer token; pushing needs write scope.
     fn authorized(&mut self, request: &mut Request) -> Reply {
-        let token = request
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv("Authorization"))
-            .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
-            .map(str::to_string);
-        let Some(token) = token else {
-            return text(
-                401,
-                "a bearer token is required: Authorization: Bearer <token>",
-            );
+        if let Err(refusal) = protocol(request) {
+            return refusal;
+        }
+        let token = match bearer(request) {
+            Ok(token) => token,
+            Err(refusal) => return refusal,
         };
         let grant = match self.authority.grant(&token) {
             Ok(Some(grant)) => grant,
@@ -127,9 +123,24 @@ impl SyncServer {
             Ok(page) => page,
             Err(reason) => return text(400, &reason),
         };
-        match self.authority.ops_after(after, limit) {
-            Ok(ops) => {
-                let next = (ops.len() == limit).then(|| ops.last().map(|(seq, _)| *seq));
+        if after > self.authority.seq() {
+            // A client past the server's log means the server's store was reset or lost.
+            return text(
+                409,
+                &format!(
+                    "after {after} is past this server's last op {}: its store is not the one \
+                     you synced with",
+                    self.authority.seq()
+                ),
+            );
+        }
+        // One row past the page says whether another page follows.
+        match self.authority.ops_after(after, limit + 1) {
+            Ok(mut ops) => {
+                let next = (ops.len() > limit).then(|| {
+                    ops.truncate(limit);
+                    ops.last().map(|(seq, _)| *seq)
+                });
                 let ops: Vec<_> = ops
                     .into_iter()
                     .map(|(seq, op)| serde_json::json!({ "seq": seq, "op": op }))
@@ -176,32 +187,103 @@ fn json(status: u16, body: serde_json::Value) -> Reply {
 /// and is capped at [`MAX_PAGE`]. Unknown or malformed parameters refuse.
 fn page(url: &str) -> Result<(i64, usize), String> {
     let query = url.split_once('?').map_or("", |(_, query)| query);
-    let (mut after, mut limit) = (None, MAX_PAGE);
-    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+    let (mut after, mut limit) = (None, None);
+    // Plain decimal digits only: no sign, no spaces, no encoding.
+    let digits = |value: &str| {
+        (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| value.parse::<u64>().ok())
+            .flatten()
+    };
+    for pair in query.split('&') {
         let (key, value) = pair
             .split_once('=')
             .ok_or_else(|| format!("query parameter `{pair}` needs a value"))?;
-        match key {
-            "after" => {
-                after = Some(
-                    value
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|after| *after >= 0)
-                        .ok_or_else(|| format!("`after` must be a seq, 0 or more: {value}"))?,
-                );
-            }
-            "limit" => {
-                limit = value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|limit| (1..=MAX_PAGE).contains(limit))
-                    .ok_or_else(|| format!("`limit` must be 1 to {MAX_PAGE}: {value}"))?;
-            }
+        let slot = match key {
+            "after" => &mut after,
+            "limit" => &mut limit,
             other => return Err(format!("unknown query parameter `{other}`")),
+        };
+        if slot.is_some() {
+            return Err(format!("`{key}` is given twice"));
         }
+        *slot =
+            Some(digits(value).ok_or_else(|| format!("`{key}` must be a whole number: {value}"))?);
     }
-    Ok((after.ok_or("`after` is required: /ops?after=N")?, limit))
+    let after = after.ok_or("`after` is required: /ops?after=N")?;
+    let after = i64::try_from(after).map_err(|_| format!("`after` is too large: {after}"))?;
+    let limit = match limit {
+        None => MAX_PAGE,
+        Some(limit) if (1..=MAX_PAGE as u64).contains(&limit) => limit as usize,
+        Some(limit) => return Err(format!("`limit` must be 1 to {MAX_PAGE}: {limit}")),
+    };
+    Ok((after, limit))
+}
+
+/// The request's protocol version must be one this server speaks: missing, malformed, below
+/// the minimum, or above this server's version answers 426 naming both sides.
+fn protocol(request: &Request) -> Result<(), Reply> {
+    let given: Vec<&str> = request
+        .headers()
+        .iter()
+        .filter(|header| header.field.equiv(super::PROTOCOL_HEADER))
+        .map(|header| header.value.as_str().trim())
+        .collect();
+    let client = match given.as_slice() {
+        [value] => value.parse::<u32>().ok(),
+        _ => None,
+    };
+    let speaks = client.is_some_and(|client| {
+        (super::MIN_PROTOCOL_VERSION..=super::PROTOCOL_VERSION).contains(&client)
+    });
+    if speaks {
+        return Ok(());
+    }
+    Err(json(
+        426,
+        serde_json::json!({
+            "error": format!(
+                "send {}: <n> with n from {} to {}",
+                super::PROTOCOL_HEADER,
+                super::MIN_PROTOCOL_VERSION,
+                super::PROTOCOL_VERSION
+            ),
+            "client": given.first(),
+            "minimum": super::MIN_PROTOCOL_VERSION,
+            "server": super::PROTOCOL_VERSION,
+        }),
+    ))
+}
+
+/// The one bearer token the request carries. The scheme is case-insensitive; a missing,
+/// repeated, or malformed `Authorization` header refuses.
+fn bearer(request: &Request) -> Result<String, Reply> {
+    let given: Vec<&str> = request
+        .headers()
+        .iter()
+        .filter(|header| header.field.equiv("Authorization"))
+        .map(|header| header.value.as_str())
+        .collect();
+    let value = match given.as_slice() {
+        [] => {
+            return Err(text(
+                401,
+                "a bearer token is required: Authorization: Bearer <token>",
+            ))
+        }
+        [value] => value.trim(),
+        _ => return Err(text(400, "send one Authorization header, not several")),
+    };
+    let token = value
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim())
+        .filter(|token| !token.is_empty() && !token.contains(char::is_whitespace));
+    token.map(str::to_string).ok_or_else(|| {
+        text(
+            401,
+            "a bearer token is required: Authorization: Bearer <token>",
+        )
+    })
 }
 
 /// A server-side failure: said to the client and logged here, never only one of the two.
@@ -235,13 +317,24 @@ mod tests {
         path: &str,
         body: &str,
     ) -> (u16, String) {
-        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
         let auth = token.map_or_else(String::new, |token| {
             format!("Authorization: Bearer {token}\r\n")
         });
+        raw(
+            addr,
+            &format!("X-Tsk-Protocol: 1\r\n{auth}"),
+            method,
+            path,
+            body,
+        )
+    }
+
+    /// One request with exactly `headers` (each ending in `\r\n`) besides the framing.
+    fn raw(addr: SocketAddr, headers: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: tsk\r\nConnection: close\r\n{auth}\
+            "{method} {path} HTTP/1.1\r\nHost: tsk\r\nConnection: close\r\n{headers}\
              Content-Length: {}\r\n\r\n{body}",
             body.len()
         )
@@ -300,7 +393,10 @@ mod tests {
         );
         let (status, body) = request(addr, Some(&token), "GET", "/health", "");
         assert_eq!(status, 200);
-        assert_eq!(body, r#"{"ops":1,"protocol_version":1,"seq":1}"#);
+        assert_eq!(
+            body,
+            r#"{"min_protocol_version":1,"ops":1,"protocol_version":1,"seq":1}"#
+        );
         let (status, body) = request(
             addr,
             Some(&token),
@@ -417,6 +513,127 @@ mod tests {
         assert_eq!(request(addr, Some(&read), "GET", "/ops?after=0", "").0, 200);
         let (status, body) = request(addr, Some(&read), "POST", "/ops", batch);
         assert_eq!(status, 403, "{body}");
+        serving.join().expect("server thread");
+    }
+
+    /// A request must name a protocol this server speaks, before anything else is checked;
+    /// the bearer scheme is case-insensitive and one Authorization header is the rule.
+    #[test]
+    fn requests_name_a_protocol_the_server_speaks_and_one_bearer_token() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&mut db).unwrap();
+        let token = super::super::tokens::add(&db, "you", Scope::Write).unwrap();
+        let authority = Authority::load(db).unwrap();
+        let mut server = SyncServer::bind("127.0.0.1:0".parse().unwrap(), authority).unwrap();
+        let addr = server.local_addr();
+        let auth = format!("Authorization: Bearer {token}\r\n");
+        let cases: Vec<(String, u16)> = vec![
+            (auth.clone(), 426),
+            (format!("X-Tsk-Protocol: 0\r\n{auth}"), 426),
+            (format!("X-Tsk-Protocol: 2\r\n{auth}"), 426),
+            (format!("X-Tsk-Protocol: one\r\n{auth}"), 426),
+            (
+                format!("X-Tsk-Protocol: 1\r\nX-Tsk-Protocol: 1\r\n{auth}"),
+                426,
+            ),
+            ("X-Tsk-Protocol: 1\r\n".into(), 401),
+            (format!("X-Tsk-Protocol: 1\r\n{auth}"), 200),
+            (
+                format!("X-Tsk-Protocol: 1\r\nAuthorization: bearer  {token}\r\n"),
+                200,
+            ),
+            (format!("X-Tsk-Protocol: 1\r\n{auth}{auth}"), 400),
+            (
+                format!("X-Tsk-Protocol: 1\r\nAuthorization: Basic {token}\r\n"),
+                401,
+            ),
+        ];
+        let count = cases.len() + 1;
+        let serving = std::thread::spawn(move || {
+            for _ in 0..count {
+                server.serve_one().expect("serve");
+            }
+        });
+        let (status, body) = raw(addr, "", "GET", "/health", "");
+        assert_eq!(status, 200, "health needs no protocol header");
+        assert!(body.contains(r#""min_protocol_version":1"#), "{body}");
+        for (headers, expected) in &cases {
+            let (status, body) = raw(addr, headers, "GET", "/snapshot", "");
+            assert_eq!(status, *expected, "{headers:?}: {body}");
+            if status == 426 {
+                let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(refusal["minimum"], 1);
+                assert_eq!(refusal["server"], 1);
+            }
+        }
+        serving.join().expect("server thread");
+    }
+
+    /// The last page says so even when it is exactly full; a strict query, and a client past
+    /// the server's log (a reset store), refuse.
+    #[test]
+    fn paging_ends_on_a_full_last_page_and_refuses_loose_queries_and_a_client_ahead() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&mut db).unwrap();
+        let token = super::super::tokens::add(&db, "you", Scope::Write).unwrap();
+        let mut authority = Authority::load(db).unwrap();
+        let ops: Vec<Op> = (0..2)
+            .map(|index| {
+                Op::local(
+                    "you",
+                    Intent::Create {
+                        task: uuid::Uuid::new_v4(),
+                        title: format!("task {index}"),
+                        notes: None,
+                        scope: TaskScope::Global,
+                        provenance: ProvenanceOrigin::Manual,
+                        thread: None,
+                        assignee: None,
+                        base: None,
+                        due: None,
+                        after: Vec::new(),
+                        steps: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        authority.submit("you", &ops).unwrap();
+        let mut server = SyncServer::bind("127.0.0.1:0".parse().unwrap(), authority).unwrap();
+        let addr = server.local_addr();
+        let refused = [
+            "/ops?after=1&after=0",
+            "/ops?after=+1",
+            "/ops?after=-0",
+            "/ops?&after=0",
+            "/ops?after=0&",
+            "/ops?after=0&limit=+2",
+        ];
+        let count = refused.len() + 3;
+        let serving = std::thread::spawn(move || {
+            for _ in 0..count {
+                server.serve_one().expect("serve");
+            }
+        });
+        let (status, body) = request(addr, Some(&token), "GET", "/ops?after=0&limit=2", "");
+        assert_eq!(status, 200, "{body}");
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["ops"].as_array().unwrap().len(), 2);
+        assert!(page["next"].is_null(), "the full page is the last: {body}");
+        let (status, body) = request(addr, Some(&token), "GET", "/ops?after=0&limit=1", "");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["next"],
+            1
+        );
+        for path in refused {
+            assert_eq!(
+                request(addr, Some(&token), "GET", path, "").0,
+                400,
+                "{path}"
+            );
+        }
+        let (status, body) = request(addr, Some(&token), "GET", "/ops?after=3", "");
+        assert_eq!(status, 409, "{body}");
         serving.join().expect("server thread");
     }
 }

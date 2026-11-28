@@ -44,10 +44,13 @@ call. One op is one undo-entry boundary; a bulk verb is one `Batch` op.
 - **Pull.** `GET /ops?after=N` (or the `/events` stream). Client applies, drops confirmed
   ops from the outbox, replays the rest. Answer `{"ops": [{"seq", "op"}], "next"}`: at most
   `limit` (default and cap 500) ops in seq order, `next` the seq to ask after for the
-  following page, null on the last.
+  following page, null on the last. `after` and `limit` are plain digits, once each; an
+  `after` past the server's last op answers 409 (the server's store is not the one the
+  client synced with).
 - **Snapshot.** `GET /snapshot` for cold start and catch-up: `{"seq", "state"}`, the
   authority's `DomainState` after op `seq`. Replaying later ops with `sync::authority::accept`
-  (apply, number, prune as the authority does) reaches the authority's state exactly.
+  (apply, number, prune undo after every op, as the authority does) reaches the
+  authority's state exactly.
 
 ## Conflict rules
 
@@ -89,7 +92,10 @@ claim is refused. A stale claim is flagged, never auto-released (human status is
   write scope (403). The token's actor is the op's actor: an op naming another is refused
   `actor-mismatch`. Ops keep their client `at`, so offline work keeps its time.
 - Protocol version in every request; the server refuses below its minimum. The strict
-  unknown-field rule moves from the file to the protocol.
+  unknown-field rule moves from the file to the protocol. Every request but `/health`
+  carries `X-Tsk-Protocol: <n>`; a missing, malformed, repeated, lower-than-minimum, or
+  higher-than-server value answers 426 `{"error", "client", "minimum", "server"}`, before
+  the token is checked. `/health` reports `protocol_version` and `min_protocol_version`.
 - Runs as a systemd unit on the VM; exe.dev's proxy fronts HTTPS. Backup: SQLite
   `.backup` on a timer to the VM disk plus off-VM copy.
 

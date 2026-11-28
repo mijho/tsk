@@ -168,6 +168,9 @@ impl Authority {
 /// Land one accepted op on `state` exactly as the authority does: apply it, number what
 /// it created, and keep the state as the store would save it. A client that replays the op
 /// log onto a snapshot with this reaches the authority's state.
+///
+/// Undo pruning runs after every op, not per batch: that is the one rule a replica can
+/// reproduce. On `Err` the state may be half-applied, so callers apply to a staged copy.
 pub fn accept(state: &mut DomainState, op: &Op) -> Result<(), String> {
     if let Some(reason) = server_refusal(op) {
         return Err(reason.to_string());

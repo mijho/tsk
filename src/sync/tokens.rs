@@ -115,7 +115,7 @@ pub fn list(db: &Connection) -> Result<Vec<(String, Scope, i64)>, DbError> {
 
 /// Revoke every token `actor` has; returns how many went.
 pub fn revoke(db: &Connection, actor: &str) -> Result<usize, DbError> {
-    Ok(db.execute("DELETE FROM tokens WHERE actor = ?1", [actor])?)
+    Ok(db.execute("DELETE FROM tokens WHERE actor = ?1", [actor.trim()])?)
 }
 
 #[cfg(test)]
@@ -169,7 +169,7 @@ mod tests {
                 ("pi".to_string(), Scope::Write, 2)
             ]
         );
-        assert_eq!(revoke(&db, "pi").unwrap(), 2);
+        assert_eq!(revoke(&db, " pi ").unwrap(), 2, "revoke trims like add");
         assert_eq!(verify(&db, &one).unwrap(), None);
         assert_eq!(verify(&db, &two).unwrap(), None);
         assert!(db
