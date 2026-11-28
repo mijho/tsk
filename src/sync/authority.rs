@@ -58,6 +58,21 @@ impl Authority {
         &self.state
     }
 
+    /// Accepted ops with `seq` above `after`, oldest first, at most `limit` of them.
+    pub fn ops_after(&self, after: i64, limit: usize) -> Result<Vec<(i64, Op)>, DbError> {
+        let mut statement = self
+            .db
+            .prepare("SELECT seq, body FROM ops WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+        let rows = statement.query_map(params![after, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (seq, body) = row?;
+            Ok((seq, serde_json::from_str(&body).map_err(DbError::Json)?))
+        })
+        .collect()
+    }
+
     /// How many ops the log holds.
     pub fn op_count(&self) -> Result<i64, DbError> {
         Ok(self
@@ -80,18 +95,9 @@ impl Authority {
                 continue;
             }
             let mut staged = state.clone();
-            let applied = match server_refusal(op) {
-                Some(reason) => Err(reason.to_string()),
-                None => staged.apply(op).map_err(|error| error.to_string()),
-            };
-            let result = match applied {
-                Ok(_) => {
+            let result = match accept(&mut staged, op) {
+                Ok(()) => {
                     let before = numbered(&state);
-                    staged.assign_numbers_for_persistence();
-                    // Release planning and launches are the server's later work (T20, T22).
-                    staged.take_completed();
-                    staged.take_pending_launches();
-                    staged.clear_merge_bases();
                     let numbers: BTreeMap<Uuid, u64> = staged
                         .tasks()
                         .iter()
@@ -131,7 +137,6 @@ impl Authority {
             };
             results.push(result);
         }
-        state.prune_undo_for_persistence();
         transaction.execute(
             "INSERT INTO projection (id, seq, state) VALUES (1, ?1, ?2)
              ON CONFLICT (id) DO UPDATE SET seq = excluded.seq, state = excluded.state",
@@ -142,6 +147,23 @@ impl Authority {
         self.seq = seq;
         Ok(results)
     }
+}
+
+/// Land one accepted op on `state` exactly as the authority does: apply it, number what
+/// it created, and keep the state as the store would save it. A client that replays the op
+/// log onto a snapshot with this reaches the authority's state.
+pub fn accept(state: &mut DomainState, op: &Op) -> Result<(), String> {
+    if let Some(reason) = server_refusal(op) {
+        return Err(reason.to_string());
+    }
+    state.apply(op).map_err(|error| error.to_string())?;
+    state.assign_numbers_for_persistence();
+    // Release planning and launches are the server's later work (T20, T22).
+    state.take_completed();
+    state.take_pending_launches();
+    state.clear_merge_bases();
+    state.prune_undo_for_persistence();
+    Ok(())
 }
 
 /// Ops the server does not take yet, and why: their server rules come with later tasks.
@@ -498,5 +520,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(authority.submit(&[op]).unwrap(), first);
+    }
+
+    /// A client that takes the snapshot, then replays the ops after its seq with [`accept`],
+    /// reaches the authority's state exactly; pages come in seq order.
+    #[test]
+    fn a_snapshot_plus_the_ops_after_it_replays_to_the_authority_state() {
+        let db = TempDb::new();
+        let mut authority = db.authority();
+        let (first, second, third) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        authority
+            .submit(&[
+                create(first, "first"),
+                create(second, "second"),
+                start(first),
+            ])
+            .unwrap();
+        let (snapshot_seq, mut replica) = (authority.seq(), authority.state().clone());
+        let step = Op::local(
+            "you",
+            Intent::Step {
+                task: second,
+                change: crate::domain::StepChange::Insert {
+                    step: crate::domain::NewStep {
+                        id: Uuid::new_v4(),
+                        text: "a step".into(),
+                    },
+                    anchor: crate::domain::StepAnchor::End,
+                },
+                undo: true,
+            },
+        );
+        let later = [create(third, "third"), step, start(second)];
+        authority.submit(&later).unwrap();
+        assert_eq!(authority.seq(), 6);
+
+        let page = authority.ops_after(snapshot_seq, 2).unwrap();
+        assert_eq!(page.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), [4, 5]);
+        let rest = authority.ops_after(5, 2).unwrap();
+        assert_eq!(rest.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), [6]);
+        for (_, op) in page.iter().chain(&rest) {
+            accept(&mut replica, op).unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(&replica).unwrap(),
+            serde_json::to_value(authority.state()).unwrap()
+        );
+        assert_eq!(replica.get(third).unwrap().number, Some(3));
+        assert!(authority.ops_after(6, 10).unwrap().is_empty());
     }
 }

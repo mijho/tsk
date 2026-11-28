@@ -42,8 +42,12 @@ call. One op is one undo-entry boundary; a bulk verb is one `Batch` op.
   (same id, actor, body) gets its stored result; an id reused for anything else is
   rejected `op-id-reused`. A batch commits as one SQLite transaction with the projection.
 - **Pull.** `GET /ops?after=N` (or the `/events` stream). Client applies, drops confirmed
-  ops from the outbox, replays the rest.
-- **Snapshot.** `GET /snapshot` for cold start and catch-up.
+  ops from the outbox, replays the rest. Answer `{"ops": [{"seq", "op"}], "next"}`: at most
+  `limit` (default and cap 500) ops in seq order, `next` the seq to ask after for the
+  following page, null on the last.
+- **Snapshot.** `GET /snapshot` for cold start and catch-up: `{"seq", "state"}`, the
+  authority's `DomainState` after op `seq`. Replaying later ops with `sync::authority::accept`
+  (apply, number, prune as the authority does) reaches the authority's state exactly.
 
 ## Conflict rules
 

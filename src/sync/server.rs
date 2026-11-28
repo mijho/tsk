@@ -12,6 +12,9 @@ use crate::domain::Op;
 /// The largest `POST /ops` body the server reads.
 const MAX_BODY: u64 = 4 << 20;
 
+/// The most ops one `GET /ops` page returns, and the default page size.
+pub const MAX_PAGE: usize = 500;
+
 /// A `POST /ops` body.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,7 +79,38 @@ impl SyncServer {
                 Err(error) => failed(&error),
             },
             (Method::Post, "/ops") => self.post_ops(request),
+            (Method::Get, "/snapshot") => json(
+                200,
+                serde_json::json!({
+                    "seq": self.authority.seq(),
+                    "state": self.authority.state(),
+                }),
+            ),
+            (Method::Get, url) if url == "/ops" || url.starts_with("/ops?") => self.get_ops(url),
             _ => text(404, "not found"),
+        }
+    }
+
+    /// `GET /ops?after=N&limit=M`: accepted ops after `seq` N in order; `next` is the seq to
+    /// ask after for the following page, absent on the last one.
+    fn get_ops(&self, url: &str) -> Reply {
+        let (after, limit) = match page(url) {
+            Ok(page) => page,
+            Err(reason) => return text(400, &reason),
+        };
+        match self.authority.ops_after(after, limit) {
+            Ok(ops) => {
+                let next = (ops.len() == limit).then(|| ops.last().map(|(seq, _)| *seq));
+                let ops: Vec<_> = ops
+                    .into_iter()
+                    .map(|(seq, op)| serde_json::json!({ "seq": seq, "op": op }))
+                    .collect();
+                json(
+                    200,
+                    serde_json::json!({ "ops": ops, "next": next.flatten() }),
+                )
+            }
+            Err(error) => failed(&error),
         }
     }
 
@@ -107,6 +141,38 @@ fn json(status: u16, body: serde_json::Value) -> Reply {
     Response::from_string(body.to_string())
         .with_status_code(status)
         .with_header(Header::from_bytes("Content-Type", "application/json").expect("header"))
+}
+
+/// The `after` and `limit` of a `GET /ops` query. `after` is required; `limit` defaults to
+/// and is capped at [`MAX_PAGE`]. Unknown or malformed parameters refuse.
+fn page(url: &str) -> Result<(i64, usize), String> {
+    let query = url.split_once('?').map_or("", |(_, query)| query);
+    let (mut after, mut limit) = (None, MAX_PAGE);
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("query parameter `{pair}` needs a value"))?;
+        match key {
+            "after" => {
+                after = Some(
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|after| *after >= 0)
+                        .ok_or_else(|| format!("`after` must be a seq, 0 or more: {value}"))?,
+                );
+            }
+            "limit" => {
+                limit = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| (1..=MAX_PAGE).contains(limit))
+                    .ok_or_else(|| format!("`limit` must be 1 to {MAX_PAGE}: {value}"))?;
+            }
+            other => return Err(format!("unknown query parameter `{other}`")),
+        }
+    }
+    Ok((after.ok_or("`after` is required: /ops?after=N")?, limit))
 }
 
 /// A server-side failure: said to the client and logged here, never only one of the two.
@@ -201,6 +267,77 @@ mod tests {
         assert!(body.starts_with("not an ops batch"), "{body}");
         assert_eq!(request(addr, "POST", "/ops", "not json").0, 400);
         assert_eq!(request(addr, "GET", "/nope", "").0, 404);
+        serving.join().expect("server thread");
+    }
+
+    #[test]
+    fn snapshot_and_ops_after_page_through_the_log_and_refuse_bad_queries() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&mut db).unwrap();
+        let mut authority = Authority::load(db).unwrap();
+        let create = |title: &str| {
+            Op::local(
+                "you",
+                Intent::Create {
+                    task: uuid::Uuid::new_v4(),
+                    title: title.into(),
+                    notes: None,
+                    scope: TaskScope::Global,
+                    provenance: ProvenanceOrigin::Manual,
+                    thread: None,
+                    assignee: None,
+                    base: None,
+                    due: None,
+                    after: Vec::new(),
+                    steps: Vec::new(),
+                },
+            )
+        };
+        let ops = [create("one"), create("two"), create("three")];
+        authority.submit(&ops).unwrap();
+        let state = serde_json::to_value(authority.state()).unwrap();
+        let mut server = SyncServer::bind("127.0.0.1:0".parse().unwrap(), authority).unwrap();
+        let addr = server.local_addr();
+        let bad = [
+            "/ops",
+            "/ops?after=-1",
+            "/ops?after=x",
+            "/ops?after=0&limit=0",
+            "/ops?after=0&limit=501",
+            "/ops?after=0&since=1",
+            "/ops?after",
+        ];
+        let serving = std::thread::spawn(move || {
+            for _ in 0..4 + bad.len() {
+                server.serve_one().expect("serve");
+            }
+        });
+        let (status, body) = request(addr, "GET", "/snapshot", "");
+        assert_eq!(status, 200);
+        let snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(snapshot["seq"], 3);
+        assert_eq!(snapshot["state"], state);
+        let page = |path: &str| {
+            let (status, body) = request(addr, "GET", path, "");
+            assert_eq!(status, 200, "{path}: {body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        };
+        let first = page("/ops?after=0&limit=2");
+        assert_eq!(first["ops"].as_array().unwrap().len(), 2);
+        assert_eq!(first["ops"][0]["seq"], 1);
+        assert_eq!(
+            first["ops"][0]["op"],
+            serde_json::to_value(&ops[0]).unwrap()
+        );
+        assert_eq!(first["next"], 2);
+        let last = page("/ops?after=2&limit=2");
+        assert_eq!(last["ops"][0]["seq"], 3);
+        assert!(last["next"].is_null());
+        assert_eq!(page("/ops?after=3")["ops"], serde_json::json!([]));
+        for path in bad {
+            let (status, body) = request(addr, "GET", path, "");
+            assert_eq!(status, 400, "{path}: {body}");
+        }
         serving.join().expect("server thread");
     }
 }
