@@ -146,7 +146,13 @@ impl Authority {
 
 /// Ops the server does not take yet, and why: their server rules come with later tasks.
 fn server_refusal(op: &Op) -> Option<&'static str> {
-    match op.intent {
+    refusal(&op.intent)
+}
+
+/// [`server_refusal`] for one intent, looking inside a transaction's intents too.
+fn refusal(intent: &Intent) -> Option<&'static str> {
+    match intent {
+        Intent::Transaction { intents } => intents.iter().find_map(refusal),
         Intent::Undo => {
             Some("not-on-server: undo is per actor on the server and lands with its own task (T21)")
         }
@@ -402,12 +408,19 @@ mod tests {
         assert_eq!(reloaded.seq(), 0, "no projection was written");
         let results = reloaded.submit(&ops).unwrap();
         assert_eq!(
-            results[0],
-            OpResult::Accepted {
-                op_id: ops[0].id,
-                seq: 1,
-                numbers: BTreeMap::from([(first, 1)]),
-            }
+            results,
+            [
+                OpResult::Accepted {
+                    op_id: ops[0].id,
+                    seq: 1,
+                    numbers: BTreeMap::from([(first, 1)]),
+                },
+                OpResult::Accepted {
+                    op_id: ops[1].id,
+                    seq: 2,
+                    numbers: BTreeMap::from([(second, 2)]),
+                },
+            ]
         );
     }
 
@@ -416,12 +429,74 @@ mod tests {
     fn undo_and_dispatch_are_refused_until_their_server_rules_land() {
         let db = TempDb::new();
         let mut authority = db.authority();
-        let undo = Op::local("you", Intent::Undo);
-        let results = authority.submit(std::slice::from_ref(&undo)).unwrap();
-        assert!(matches!(
-            results.as_slice(),
-            [OpResult::Rejected { reason, .. }] if reason.starts_with("not-on-server")
-        ));
-        assert_eq!(authority.op_count().unwrap(), 0);
+        let task = Uuid::new_v4();
+        authority.submit(&[create(task, "kept")]).unwrap();
+        let dispatch = Intent::Dispatch {
+            change: Box::new(crate::domain::DispatchIntent::ReleaseStart {
+                task,
+                prerequisite: task,
+            }),
+        };
+        let ops = [
+            Op::local("you", Intent::Undo),
+            Op::local("you", dispatch.clone()),
+            Op::local(
+                "you",
+                Intent::Transaction {
+                    intents: vec![Intent::Undo],
+                },
+            ),
+            Op::local(
+                "you",
+                Intent::Transaction {
+                    intents: vec![dispatch],
+                },
+            ),
+        ];
+        let state = serde_json::to_value(authority.state()).unwrap();
+        for _ in 0..2 {
+            // The resend gets the same refusal.
+            let results = authority.submit(&ops).unwrap();
+            assert!(
+                results.iter().all(|result| matches!(
+                    result,
+                    OpResult::Rejected { reason, .. } if reason.starts_with("not-on-server")
+                )),
+                "{results:?}"
+            );
+        }
+        assert_eq!(
+            authority.op_count().unwrap(),
+            1,
+            "only the create is logged"
+        );
+        assert_eq!(serde_json::to_value(authority.state()).unwrap(), state);
+    }
+
+    /// A resend is the same op even when its stored text differs, say in key order.
+    #[test]
+    fn a_resend_matches_the_stored_op_parsed_not_as_text() {
+        let db = TempDb::new();
+        let mut authority = db.authority();
+        let op = create(Uuid::new_v4(), "stored");
+        let first = authority.submit(std::slice::from_ref(&op)).unwrap();
+        let mut value = serde_json::to_value(&op).unwrap();
+        let reordered: serde_json::Map<String, serde_json::Value> = value
+            .as_object_mut()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let text = serde_json::Value::Object(reordered).to_string();
+        assert_ne!(text, serde_json::to_string(&op).unwrap());
+        authority
+            .db
+            .execute(
+                "UPDATE ops SET body = ?1 WHERE op_id = ?2",
+                params![text, op.id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(authority.submit(&[op]).unwrap(), first);
     }
 }

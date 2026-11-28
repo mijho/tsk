@@ -1,6 +1,7 @@
 //! The server's SQLite database: the op log with each op's result, refused ops, the
-//! authority's projection, counters, actor tokens, and the protocol version. Schema versions are SQLite's `user_version`; each migration
-//! moves one version forward in its own transaction.
+//! authority's projection, counters, actor tokens, and the protocol version. Schema
+//! versions are SQLite's `user_version`; each migration moves one version forward in its
+//! own transaction.
 
 use std::fmt;
 use std::path::Path;
@@ -27,9 +28,9 @@ const MIGRATIONS: &[&str] = &[
          actor TEXT NOT NULL,
          scope TEXT NOT NULL
      ) STRICT;",
-    // v2: every op keeps its result, so a resent op_id gets the original answer (task_id,
-    // never written, goes). Accepted
-    // ops record the numbers their creates got; refused ones keep their reason, unordered.
+    // v2: every op keeps its result, so a resent op_id gets the original answer, and the
+    // never-written task_id goes. Accepted ops record the numbers their creates got;
+    // refused ones keep their reason, unordered.
     // The authority's state is one projection row, written with the ops it reflects.
     "ALTER TABLE ops ADD COLUMN numbers TEXT NOT NULL DEFAULT '{}';
      DROP INDEX ops_task;

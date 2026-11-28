@@ -74,8 +74,9 @@ claim is refused. A stale claim is flagged, never auto-released (human status is
 - SQLite (`rusqlite`, bundled). Tables: `ops(seq, op_id UNIQUE, actor, at, body, numbers)`,
   `rejections(op_id, actor, body, reason)`, `projection(seq, state)` (the authority's
   `DomainState`), `counters`, `tokens(hash, actor, scope)`, `meta(protocol_version)`.
-- The server takes no `Undo` or `Dispatch` op until per-actor undo (T21) and host-tagged
-  dispatch (T22) define them; both are refused `not-on-server`.
+- The server takes no `Undo` or `Dispatch` op, alone or inside a `Transaction`, until
+  per-actor undo (T21) and host-tagged dispatch (T22) define them; both are refused
+  `not-on-server`.
 - Endpoints: `POST /ops`, `GET /snapshot`, `GET /ops?after=N`, `GET /events` (SSE),
   `GET /` (PWA). Bearer token per actor; actor lands in every history event.
 - Protocol version in every request; the server refuses below its minimum. The strict
